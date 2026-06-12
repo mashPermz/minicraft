@@ -2,6 +2,8 @@
 
 ブラウザで動く軽量マインクラフト風ゲーム(Rust製)。**v1 完成・動作確認済み。**
 
+リポジトリ: https://github.com/mashPermz/minicraft (private)
+
 ## 遊び方
 
 ```sh
