@@ -59,6 +59,7 @@ lsof -ti:8080 | xargs kill
 - `mouse_delta_position()` は「前回-今回」を返す(符号が直感の逆)
 - **miniquad 0.4.10 は depth_write=false で深度テストごと無効化**(gl.rs の apply_pipeline が glDisable(GL_DEPTH_TEST) を呼ぶ)。半透明パイプラインでも depth_write=true にしないと、水・雲が手前の地形を無視して描かれる
 - **macroquad は1ドローコールあたり頂点10000/インデックス5000で黙ってクランプ**(QuadGl::geometry() が超過分を warn だけで切り捨て)。超えそうなメッシュは3200頂点で分割する(mesher.rs / sky.rs の Clouds)。`gl_set_drawcall_buffer_capacity` での拡大は、ドローコール毎にmaxサイズのGPUバッファが確保されるためメモリが膨らみ非推奨
+- **web/mq_js_bundle.js の quad_net プラグインは `register_plugin` を宣言なしのグローバル代入**で定義しており、strict 環境で `ReferenceError: register_plugin is not defined` になる → `var` 宣言+文の分離(カンマ式→セミコロン)にパッチ済み。バンドルを上流から更新したら再適用が必要
 
 ## 調整履歴
 - [2026-06-13] 葉・幹が真っ黒になる問題: heightsとAO遮蔽が葉を含んでいたため樹冠の下が「地下」扱いに → どちらも不透明ブロック限定に変更、AO_LUTも軟化 [0.48, 0.69, 0.85, 1.0]。修正後の見た目良好(docs/screenshot.png)
@@ -75,3 +76,4 @@ lsof -ti:8080 | xargs kill
 ## 作業ログ
 - [2026-06-13] 開始。Rust 1.96更新、設計、全8モジュール実装(~1900行)、wasmビルド成功(564KB)、ヘッドレスChromeで描画検証、葉の暗さ修正。v1完成。
 - [2026-06-13] 初回プレイテストのFB対応(v1.1)。不具合5件(深度2件は miniquad の depth_write 挙動が根本原因)+機能3件(R/V/M)。audio.rs 追加で9モジュール、wasm 588KB。ヘッドレスChromeで検証済み、実プレイ再確認待ち。
+- [2026-06-13] `cargo clippy --all-targets -- -D warnings` を警告ゼロに(既存コード含む16件: is_multiple_of / needless_range_loop / nonminimal_bool / too_many_arguments ほか)。mq_js_bundle.js の register_plugin ReferenceError をパッチ。
