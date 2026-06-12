@@ -85,7 +85,9 @@ impl Bufs {
     }
 
     fn quad(&mut self, corners: [Vec3; 4], uvs: [(f32, f32); 4], bright: [f32; 4], flip: bool) {
-        if self.v.len() + 4 > 65532 {
+        // macroquadは1ドローコールあたり頂点10000/インデックス5000で黙って
+        // クランプする(超過分の面が欠落する)ため、その内側で分割する
+        if self.v.len() + 4 > 3200 {
             self.flush();
         }
         let base = self.v.len() as u16;
