@@ -123,30 +123,46 @@ pub fn draw_celestial(cam: &Camera3D, eye: Vec3, ds: &DayState) {
     let h = screen_height();
     let warm = (-(ds.sun_dir.y / 0.13) * (ds.sun_dir.y / 0.13)).exp();
 
-    // 太陽
+    // 太陽(マインクラフト風の四角。淡い四角ハロ+本体)
     let sun_a = (ds.sun_dir.y * 8.0 + 1.0).clamp(0.0, 1.0);
     if sun_a > 0.0 {
         if let Some((x, y)) = project(m, eye + ds.sun_dir * 600.0) {
             let c = mix3(vec3(1.0, 0.96, 0.82), vec3(1.0, 0.55, 0.28), warm);
-            for (r, a) in [(0.30, 0.07), (0.12, 0.16), (0.045, 0.95)] {
-                draw_circle(x, y, h * r, Color::new(c.x, c.y, c.z, a * sun_a));
+            let s = h * 0.10;
+            for (r, a) in [(1.6, 0.14), (1.0, 0.96)] {
+                let half = s * r * 0.5;
+                draw_rectangle(
+                    x - half,
+                    y - half,
+                    s * r,
+                    s * r,
+                    Color::new(c.x, c.y, c.z, a * sun_a),
+                );
             }
         }
     }
 
-    // 月
+    // 月(四角)
     let moon_a = ((-ds.sun_dir.y) * 8.0 + 0.4).clamp(0.0, 1.0);
     if moon_a > 0.0 {
         if let Some((x, y)) = project(m, eye - ds.sun_dir * 600.0) {
-            for (r, a) in [(0.10, 0.10), (0.034, 0.92)] {
-                draw_circle(x, y, h * r, Color::new(0.82, 0.86, 0.95, a * moon_a));
+            let s = h * 0.072;
+            for (r, a) in [(1.4, 0.10), (1.0, 0.92)] {
+                let half = s * r * 0.5;
+                draw_rectangle(
+                    x - half,
+                    y - half,
+                    s * r,
+                    s * r,
+                    Color::new(0.82, 0.86, 0.95, a * moon_a),
+                );
             }
         }
     }
 }
 
 pub struct Clouds {
-    pub mesh: Mesh,
+    pub meshes: Vec<Mesh>,
     key: (i64, i64, i64),
     seed: u32,
 }
@@ -154,11 +170,7 @@ pub struct Clouds {
 impl Clouds {
     pub fn new(seed: u32) -> Clouds {
         let mut c = Clouds {
-            mesh: Mesh {
-                vertices: Vec::new(),
-                indices: Vec::new(),
-                texture: None,
-            },
+            meshes: Vec::new(),
             key: (i64::MAX, 0, 0),
             seed,
         };
@@ -182,8 +194,9 @@ impl Clouds {
     }
 
     fn rebuild(&mut self, pcx: i64, pcz: i64, drift_cell: i64) {
-        let mut verts = Vec::new();
+        let mut verts: Vec<Vertex> = Vec::new();
         let mut idx: Vec<u16> = Vec::new();
+        self.meshes.clear();
         for dz in -CLOUD_R..=CLOUD_R {
             for dx in -CLOUD_R..=CLOUD_R {
                 let gx = pcx + dx;
@@ -198,8 +211,14 @@ impl Clouds {
                 if n < 0.28 {
                     continue;
                 }
-                if verts.len() + 4 > 65532 {
-                    break;
+                // macroquadは1ドローコールあたり頂点10000/インデックス5000で
+                // 黙ってクランプするため、上限内で複数メッシュに分割する
+                if verts.len() + 4 > 3200 {
+                    self.meshes.push(Mesh {
+                        vertices: std::mem::take(&mut verts),
+                        indices: std::mem::take(&mut idx),
+                        texture: None,
+                    });
                 }
                 let x = gx as f32 * CELL;
                 let z = gz as f32 * CELL;
@@ -215,10 +234,12 @@ impl Clouds {
                 idx.extend([0, 1, 2, 0, 2, 3].iter().map(|o| base + o));
             }
         }
-        self.mesh = Mesh {
-            vertices: verts,
-            indices: idx,
-            texture: None,
-        };
+        if !verts.is_empty() {
+            self.meshes.push(Mesh {
+                vertices: verts,
+                indices: idx,
+                texture: None,
+            });
+        }
     }
 }
