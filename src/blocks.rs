@@ -54,7 +54,7 @@ pub const TILE_COAL: (u32, u32) = (2, 3);
 impl Block {
     pub fn from_u8(v: u8) -> Block {
         if v <= Block::Coal as u8 {
-            unsafe { std::mem::transmute(v) }
+            unsafe { std::mem::transmute::<u8, Block>(v) }
         } else {
             Block::Air
         }

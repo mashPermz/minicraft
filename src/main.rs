@@ -330,7 +330,7 @@ async fn main() {
             ready = true;
         }
         // 遠方チャンクの破棄(たまに実行)
-        if frame_no % 120 == 0 {
+        if frame_no.is_multiple_of(120) {
             let keep = radius + 4;
             w.chunks
                 .retain(|&(cx, cz), _| (cx - pcx).abs() <= keep && (cz - pcz).abs() <= keep);
@@ -548,7 +548,7 @@ async fn main() {
         }
 
         // 水(遠い順に描画)
-        visible.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        visible.sort_unstable_by_key(|v| std::cmp::Reverse(v.0));
         gl_use_material(&water_mat);
         for (_, c) in &visible {
             for m in &c.water_meshes {
@@ -626,7 +626,7 @@ async fn main() {
                     ..Default::default()
                 },
             );
-            draw_text(&format!("{}", i + 1), x + 4.0, y0 + 14.0, 16.0, GRAY);
+            draw_text(format!("{}", i + 1), x + 4.0, y0 + 14.0, 16.0, GRAY);
             if i == sel {
                 draw_rectangle_lines(x - 1.0, y0 - 1.0, s + 2.0, s + 2.0, 3.0, WHITE);
             }

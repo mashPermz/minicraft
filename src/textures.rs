@@ -88,7 +88,7 @@ fn log_top(x: u32, y: u32) -> Color {
     let d = dx.max(dy) as u32;
     if d >= 7 {
         log_side(x, y)
-    } else if d % 2 == 0 {
+    } else if d.is_multiple_of(2) {
         speckle((186, 152, 98), 8, x, y, 53)
     } else {
         speckle((158, 124, 76), 8, x, y, 54)
@@ -136,8 +136,8 @@ fn plank(x: u32, y: u32) -> Color {
     let row = y / 4;
     let seam_y = y % 4 == 3;
     let joint = {
-        let off = (hash_u32(row.wrapping_mul(977)) % 16) as u32;
-        (x + off) % 8 == 0
+        let off = hash_u32(row.wrapping_mul(977)) % 16;
+        (x + off).is_multiple_of(8)
     };
     if seam_y || joint {
         rgba(126, 96, 58, 255)
@@ -151,7 +151,7 @@ fn plank(x: u32, y: u32) -> Color {
 fn cobble(x: u32, y: u32) -> Color {
     // 丸石: 4x4セルの石 + 目地
     let jx = (px_noise(x / 4, y / 4, 101) * 2.0) as u32;
-    let mortar = (x + jx) % 4 == 0 || (y + jx) % 4 == 0;
+    let mortar = (x + jx).is_multiple_of(4) || (y + jx).is_multiple_of(4);
     if mortar {
         rgba(86, 86, 88, 255)
     } else {
@@ -184,9 +184,11 @@ fn coal(x: u32, y: u32) -> Color {
     }
 }
 
+type TileFn = fn(u32, u32) -> Color;
+
 pub fn build_atlas() -> Texture2D {
     let mut img = Image::gen_image_color(ATLAS_PX as u16, ATLAS_PX as u16, WHITE);
-    let tiles: [(u32, u32, fn(u32, u32) -> Color); 15] = [
+    let tiles: [(u32, u32, TileFn); 15] = [
         (0, 0, grass_top),
         (1, 0, grass_side),
         (2, 0, |x, y| dirt(x, y, 12)),
