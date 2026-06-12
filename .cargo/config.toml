@@ -1,0 +1,4 @@
+# miniquadのGL関数は実行時にJS(mq_js_bundle.js)から提供されるため、
+# wasmリンク時の未定義シンボルを許可する
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--allow-undefined"]
