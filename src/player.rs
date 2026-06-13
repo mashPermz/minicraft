@@ -10,7 +10,7 @@ pub const EYE: f32 = 1.62;
 
 const GRAVITY: f32 = 26.0;
 const JUMP_V: f32 = 8.4;
-const WALK: f32 = 4.4;
+const WALK: f32 = 3.7;
 const SPRINT: f32 = 6.9;
 const FLY: f32 = 12.0;
 
@@ -21,6 +21,8 @@ pub struct Player {
     pub pitch: f32,
     pub fly: bool,
     pub on_ground: bool,
+    pub run_mode: bool, // Rで切り替える持続ダッシュ
+    walk_phase: f32,    // 三人称モデルの手足振り用
 }
 
 impl Player {
@@ -32,6 +34,8 @@ impl Player {
             pitch: -0.15,
             fly: false,
             on_ground: false,
+            run_mode: false,
+            walk_phase: 0.0,
         }
     }
 
@@ -84,6 +88,9 @@ impl Player {
             self.fly = !self.fly;
             self.vel.y = 0.0;
         }
+        if active && is_key_pressed(KeyCode::R) {
+            self.run_mode = !self.run_mode;
+        }
 
         let fwd = vec3(self.yaw.cos(), 0.0, self.yaw.sin());
         let right = vec3(-self.yaw.sin(), 0.0, self.yaw.cos());
@@ -107,7 +114,7 @@ impl Player {
         if wish.length_squared() > 0.0 {
             wish = wish.normalize();
         }
-        let sprint = active && is_key_down(KeyCode::LeftShift);
+        let sprint = active && (is_key_down(KeyCode::LeftShift) || self.run_mode);
         let in_water = self.in_water(world);
 
         if self.fly {
@@ -141,6 +148,27 @@ impl Player {
                     self.vel.y += 30.0 * dt;
                 }
                 self.vel.y = self.vel.y.clamp(-3.5, 3.5);
+                // 岸ジャンプ: 泳ぎの上昇上限では1ブロックの岸に登れないため、
+                // 水面付近で岸(進行方向の固体ブロック)に向かっている間は
+                // 通常ジャンプ相当の上昇を与えて陸に上がれるようにする
+                if active && is_key_down(KeyCode::Space) && wish.length_squared() > 0.0 {
+                    let head_out = world.get_block(
+                        self.pos.x.floor() as i32,
+                        (self.pos.y + 1.1).floor() as i32,
+                        self.pos.z.floor() as i32,
+                    ) != Block::Water;
+                    let f = self.pos + wish * 0.9;
+                    let (fx, fy, fz) = (
+                        f.x.floor() as i32,
+                        self.pos.y.floor() as i32,
+                        f.z.floor() as i32,
+                    );
+                    let shore = world.get_block(fx, fy, fz).is_solid()
+                        || world.get_block(fx, fy + 1, fz).is_solid();
+                    if head_out && shore {
+                        self.vel.y = JUMP_V;
+                    }
+                }
             } else {
                 self.vel.y -= GRAVITY * dt;
                 self.vel.y = self.vel.y.max(-50.0);
@@ -155,6 +183,51 @@ impl Player {
         self.move_axis(world, 0, delta.x);
         self.move_axis(world, 1, delta.y);
         self.move_axis(world, 2, delta.z);
+
+        let hs = (self.vel.x * self.vel.x + self.vel.z * self.vel.z).sqrt();
+        self.walk_phase += hs * dt * 2.4;
+    }
+
+    /// 三人称視点用の簡易ブロックマン(足元中心、+xが正面)
+    pub fn draw_model(&self, light: Vec3) {
+        let hs = (self.vel.x * self.vel.x + self.vel.z * self.vel.z).sqrt();
+        let swing = self.walk_phase.sin() * (hs / WALK).min(1.3) * 0.55;
+        let cl = |r: f32, g: f32, b: f32| Color::new(r * light.x, g * light.y, b * light.z, 1.0);
+        let skin = cl(0.85, 0.67, 0.53);
+        let shirt = cl(0.21, 0.55, 0.58);
+        let pants = cl(0.27, 0.30, 0.52);
+
+        unsafe {
+            get_internal_gl().quad_gl.push_model_matrix(
+                Mat4::from_translation(self.pos) * Mat4::from_rotation_y(-self.yaw),
+            );
+        }
+        draw_cube(vec3(0.0, 1.08, 0.0), vec3(0.26, 0.66, 0.50), None, shirt);
+        draw_cube(vec3(0.0, 1.63, 0.0), vec3(0.44, 0.44, 0.44), None, skin);
+        for side in [1.0f32, -1.0] {
+            let a = swing * side;
+            unsafe {
+                get_internal_gl().quad_gl.push_model_matrix(
+                    Mat4::from_translation(vec3(0.0, 0.78, 0.125 * side))
+                        * Mat4::from_rotation_z(a),
+                );
+            }
+            draw_cube(vec3(0.0, -0.39, 0.0), vec3(0.24, 0.78, 0.22), None, pants);
+            unsafe {
+                get_internal_gl().quad_gl.pop_model_matrix();
+                get_internal_gl().quad_gl.push_model_matrix(
+                    Mat4::from_translation(vec3(0.0, 1.36, 0.36 * side))
+                        * Mat4::from_rotation_z(-a * 0.7),
+                );
+            }
+            draw_cube(vec3(0.0, -0.28, 0.0), vec3(0.20, 0.60, 0.20), None, skin);
+            unsafe {
+                get_internal_gl().quad_gl.pop_model_matrix();
+            }
+        }
+        unsafe {
+            get_internal_gl().quad_gl.pop_model_matrix();
+        }
     }
 
     fn move_axis(&mut self, world: &World, axis: usize, amount: f32) {

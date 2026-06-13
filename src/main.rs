@@ -1,5 +1,6 @@
 // minicraft: ブラウザで動く軽量マインクラフト風ゲーム
 
+mod audio;
 mod blocks;
 mod mesher;
 mod noise;
@@ -9,6 +10,7 @@ mod textures;
 mod world;
 
 use blocks::{Block, HOTBAR};
+use macroquad::audio::{play_sound, stop_sound, PlaySoundParams};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude::*;
 use player::Player;
@@ -149,8 +151,12 @@ fn make_materials() -> (Material, Material, Material) {
         BlendFactor::Value(BlendValue::SourceAlpha),
         BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
     );
+    // 注意: miniquad 0.4.10 は depth_write=false のパイプラインで深度テスト自体を
+    // 無効化する(apply_pipeline が glDisable(GL_DEPTH_TEST) を呼ぶ)。水・雲が
+    // 手前の地形を無視して描かれてしまうため、depth_write も有効にして回避する。
+    // 水面・雲は互いにほぼ重ならないので深度書き込みの弊害は実用上ない。
     let transparent = PipelineParams {
-        depth_write: false,
+        depth_write: true,
         depth_test: Comparison::LessOrEqual,
         color_blend: Some(blend),
         ..Default::default()
@@ -287,6 +293,7 @@ async fn main() {
     let seed = (macroquad::miniquad::date::now() as u32) | 1;
     let atlas = textures::build_atlas();
     let (terrain_mat, water_mat, cloud_mat) = make_materials();
+    let bgm = audio::load_bgm().await;
 
     let mut w = World::new(seed);
     let (sx, sz) = find_spawn(seed);
@@ -302,6 +309,8 @@ async fn main() {
     let mut show_debug = false;
     let mut edit_cd = 0.0f32;
     let mut frame_no: u64 = 0;
+    let mut third_person = false;
+    let mut bgm_on = false;
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -321,7 +330,7 @@ async fn main() {
             ready = true;
         }
         // 遠方チャンクの破棄(たまに実行)
-        if frame_no % 120 == 0 {
+        if frame_no.is_multiple_of(120) {
             let keep = radius + 4;
             w.chunks
                 .retain(|&(cx, cz), _| (cx - pcx).abs() <= keep && (cz - pcz).abs() <= keep);
@@ -351,6 +360,25 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Equal) {
             radius = (radius + 1).min(7);
+        }
+        if is_key_pressed(KeyCode::V) {
+            third_person = !third_person;
+        }
+        if is_key_pressed(KeyCode::M) {
+            if let Some(s) = &bgm {
+                bgm_on = !bgm_on;
+                if bgm_on {
+                    play_sound(
+                        s,
+                        PlaySoundParams {
+                            looped: true,
+                            volume: 0.5,
+                        },
+                    );
+                } else {
+                    stop_sound(s);
+                }
+            }
         }
 
         // --- ホットバー選択 ---
@@ -385,6 +413,25 @@ async fn main() {
         }
         let eye = player.eye();
         let look = player.dir();
+        // 三人称: 頭の後方にカメラを置き、地形にめり込む場合は手前に寄せる
+        let cam_pos = if third_person {
+            let mut dist = 4.5f32;
+            let mut t = 0.2;
+            while t < 4.5 {
+                let p = eye - look * t;
+                if w
+                    .get_block(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
+                    .is_solid()
+                {
+                    dist = (t - 0.4).max(0.4);
+                    break;
+                }
+                t += 0.1;
+            }
+            eye - look * dist
+        } else {
+            eye
+        };
 
         // --- ブロック編集 ---
         edit_cd = (edit_cd - dt).max(0.0);
@@ -412,7 +459,7 @@ async fn main() {
         // --- 空と光 ---
         let ds = sky::day_state(time);
         let underwater = {
-            let e = eye.floor();
+            let e = cam_pos.floor();
             w.get_block(e.x as i32, e.y as i32, e.z as i32) == Block::Water
         };
         let fend = (radius * CS) as f32 - 6.0;
@@ -432,19 +479,19 @@ async fn main() {
         }
 
         let cam = Camera3D {
-            position: eye,
+            position: cam_pos,
             target: eye + look,
             up: vec3(0.0, 1.0, 0.0),
             fovy: FOVY,
             ..Default::default()
         };
         if !underwater {
-            sky::draw_celestial(&cam, eye, &ds);
+            sky::draw_celestial(&cam, cam_pos, &ds);
         }
         set_camera(&cam);
 
         for m in [&terrain_mat, &water_mat] {
-            m.set_uniform("CamPos", eye);
+            m.set_uniform("CamPos", cam_pos);
             m.set_uniform("FogStart", fog_start);
             m.set_uniform("FogEnd", fog_end);
             m.set_uniform("FogColor", fog_color);
@@ -482,18 +529,26 @@ async fn main() {
             }
         }
 
+        // 三人称時は自キャラを描く(水より先に描いて水越しの見た目を正しく)
+        if third_person {
+            gl_use_default_material();
+            player.draw_model(ds.light);
+        }
+
         // 雲
         if !underwater {
             let off = clouds.update(player.pos, time as f32);
-            cloud_mat.set_uniform("CamPos", eye);
+            cloud_mat.set_uniform("CamPos", cam_pos);
             cloud_mat.set_uniform("Offset", off);
             cloud_mat.set_uniform("CloudColor", vec3(0.93, 0.95, 0.99) * (0.25 + 0.75 * ds.lf));
             gl_use_material(&cloud_mat);
-            draw_mesh(&clouds.mesh);
+            for m in &clouds.meshes {
+                draw_mesh(m);
+            }
         }
 
         // 水(遠い順に描画)
-        visible.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        visible.sort_unstable_by_key(|v| std::cmp::Reverse(v.0));
         gl_use_material(&water_mat);
         for (_, c) in &visible {
             for m in &c.water_meshes {
@@ -571,10 +626,30 @@ async fn main() {
                     ..Default::default()
                 },
             );
-            draw_text(&format!("{}", i + 1), x + 4.0, y0 + 14.0, 16.0, GRAY);
+            draw_text(format!("{}", i + 1), x + 4.0, y0 + 14.0, 16.0, GRAY);
             if i == sel {
                 draw_rectangle_lines(x - 1.0, y0 - 1.0, s + 2.0, s + 2.0, 3.0, WHITE);
             }
+        }
+
+        // 状態表示(ダッシュ/BGM)
+        if player.run_mode {
+            draw_text(
+                "RUN",
+                x0 + 9.0 * s + 14.0,
+                y0 + 18.0,
+                22.0,
+                Color::new(1.0, 0.9, 0.3, 0.9),
+            );
+        }
+        if bgm_on {
+            draw_text(
+                "BGM",
+                x0 + 9.0 * s + 14.0,
+                y0 + 40.0,
+                22.0,
+                Color::new(0.6, 0.9, 1.0, 0.9),
+            );
         }
 
         // デバッグ表示
@@ -586,7 +661,13 @@ async fn main() {
                     player.pos.x, player.pos.y, player.pos.z, pcx, pcz
                 ),
                 format!("chunks: {}  tris: {}k", w.chunks.len(), tri_count / 1000),
-                format!("radius: {} (-/= to change)  fly: {}", radius, player.fly),
+                format!(
+                    "radius: {} (-/= to change)  fly: {}  run: {}  view: {}",
+                    radius,
+                    player.fly,
+                    player.run_mode,
+                    if third_person { "3rd" } else { "1st" }
+                ),
             ];
             for (i, l) in lines.iter().enumerate() {
                 draw_text(l, 10.0, 22.0 + i as f32 * 20.0, 20.0, WHITE);
@@ -603,9 +684,9 @@ async fn main() {
             let lines: [(&str, f32); 5] = [
                 ("MINICRAFT", 34.0),
                 ("Click to play", 24.0),
-                ("WASD: move  Space: jump  F: fly  Shift: sprint", 18.0),
+                ("WASD: move  Space: jump  F: fly  Shift: sprint  R: run", 18.0),
                 ("L-click: break  R-click: place  1-9 / wheel: select", 18.0),
-                ("Tab: debug  Esc: release mouse", 18.0),
+                ("V: view  M: music  Tab: debug  Esc: release mouse", 18.0),
             ];
             let mut ty = py + 44.0;
             for (l, size) in lines {
