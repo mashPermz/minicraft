@@ -85,7 +85,9 @@ impl Bufs {
     }
 
     fn quad(&mut self, corners: [Vec3; 4], uvs: [(f32, f32); 4], bright: [f32; 4], flip: bool) {
-        if self.v.len() + 4 > 65532 {
+        // macroquadは1ドローコールあたり頂点10000/インデックス5000で黙って
+        // クランプする(超過分の面が欠落する)ため、その内側で分割する
+        if self.v.len() + 4 > 3200 {
             self.flush();
         }
         let base = self.v.len() as u16;
@@ -200,15 +202,14 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
                 let pz = wz0 + lz as f32;
 
                 if b == Block::Water {
-                    emit_water(&snap, &mut water, lx, y, lz, px, py, pz);
+                    emit_water(&snap, &mut water, lx, y, lz, vec3(px, py, pz));
                     continue;
                 }
 
-                for f in 0..6 {
-                    let (n, corners, shade) = FACES[f];
+                for (f, &(n, corners, shade)) in FACES.iter().enumerate() {
                     let nb = snap.get(lx + n[0], y + n[1], lz + n[2]);
-                    let visible = !nb.is_opaque() && !(nb == b && b.merges());
-                    if !visible {
+                    let hidden = nb.is_opaque() || (nb == b && b.merges());
+                    if hidden {
                         continue;
                     }
                     let ao = face_ao(&snap, lx, y, lz, f);
@@ -233,16 +234,7 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
     (solid.out, water.out)
 }
 
-fn emit_water(
-    snap: &Snapshot,
-    bufs: &mut Bufs,
-    lx: i32,
-    y: i32,
-    lz: i32,
-    px: f32,
-    py: f32,
-    pz: f32,
-) {
+fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec3) {
     let above = snap.get(lx, y + 1, lz);
     let top_h = if above == Block::Water { 1.0 } else { 0.85 };
 
@@ -250,17 +242,16 @@ fn emit_water(
     if above != Block::Water && !above.is_opaque() {
         let uvs = face_uvs(0, Block::Water.tile(0));
         let c = [
-            vec3(px, py + top_h, pz),
-            vec3(px, py + top_h, pz + 1.0),
-            vec3(px + 1.0, py + top_h, pz + 1.0),
-            vec3(px + 1.0, py + top_h, pz),
+            vec3(p.x, p.y + top_h, p.z),
+            vec3(p.x, p.y + top_h, p.z + 1.0),
+            vec3(p.x + 1.0, p.y + top_h, p.z + 1.0),
+            vec3(p.x + 1.0, p.y + top_h, p.z),
         ];
         bufs.quad(c, uvs, [1.0; 4], false);
     }
 
     // 側面(水でも不透明でもない隣に対して)
-    for f in 2..6 {
-        let (n, corners, shade) = FACES[f];
+    for (f, &(n, corners, shade)) in FACES.iter().enumerate().skip(2) {
         let nb = snap.get(lx + n[0], y + n[1], lz + n[2]);
         if nb == Block::Water || nb.is_opaque() {
             continue;
@@ -270,7 +261,7 @@ fn emit_water(
         for k in 0..4 {
             let c = corners[k];
             let cy = if c[1] == 1 { top_h } else { 0.0 };
-            cs4[k] = vec3(px + c[0] as f32, py + cy, pz + c[2] as f32);
+            cs4[k] = vec3(p.x + c[0] as f32, p.y + cy, p.z + c[2] as f32);
         }
         bufs.quad(cs4, uvs, [shade; 4], false);
     }

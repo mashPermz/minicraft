@@ -66,9 +66,8 @@ fn tree_at(seed: u32, x: i32, z: i32, h: i32, temp: f32) -> Option<i32> {
 }
 
 fn top_block(h: i32, temp: f32) -> Block {
-    if h <= SEA + 1 {
-        Block::Sand
-    } else if temp > 0.72 {
+    // 水際または高温(砂漠)は砂
+    if h <= SEA + 1 || temp > 0.72 {
         Block::Sand
     } else if temp < 0.26 || h >= 68 {
         Block::SnowGrass
@@ -200,7 +199,7 @@ impl World {
     }
 
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, b: Block) {
-        if y < 0 || y >= CH {
+        if !(0..CH).contains(&y) {
             return;
         }
         let (cx, cz) = (x.div_euclid(CS), z.div_euclid(CS));
