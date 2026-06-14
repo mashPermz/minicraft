@@ -2,6 +2,8 @@
 // wasmではブラウザのlocalStorage(web/index.htmlのプラグインがenvに注入)、
 // ネイティブ(テスト実行)では一時ファイルに保存する。
 
+use crate::blocks::Block;
+use crate::world::CH;
 use macroquad::prelude::*;
 use std::collections::HashMap;
 
@@ -97,7 +99,12 @@ pub fn parse(s: &str) -> Option<SaveData> {
         let y: i32 = tok.next()?.parse().ok()?;
         let z: i32 = tok.next()?.parse().ok()?;
         let b: u8 = tok.next()?.parse().ok()?;
-        edits.insert((x, y, z), b);
+        // localStorage は手動書き換えや旧フォーマットが残り得る。トークン数が揃って
+        // いても、範囲外の y(チャンク生成時に idx() で panic)や未定義のブロックIDは
+        // 不正データなので、その行だけ捨ててセーブ全体の起動は守る
+        if (0..CH).contains(&y) && b <= Block::FlowerYellow as u8 {
+            edits.insert((x, y, z), b);
+        }
     }
     Some(SaveData {
         seed,
@@ -143,5 +150,16 @@ mod tests {
         assert!(parse("").is_none());
         assert!(parse("XX 1").is_none());
         assert!(parse("MC1 1\n0 0 0 0 0 0 0\n1 2 3").is_none()); // 編集行が欠けている
+    }
+
+    #[test]
+    fn parse_skips_out_of_range_rows() {
+        // 構造は揃っていても値が不正な行は捨て、正常な行だけ残す(起動時 panic を防ぐ)
+        let s = format!(
+            "MC1 1\n0 0 0 0 0 0 0\n1 {CH} 1 3\n2 -5 2 3\n3 40 3 200\n4 40 4 10\n"
+        );
+        let p = parse(&s).unwrap();
+        assert_eq!(p.edits.len(), 1); // y=CH(範囲外)/y=-5/block=200 は除外
+        assert_eq!(p.edits.get(&(4, 40, 4)), Some(&10u8));
     }
 }

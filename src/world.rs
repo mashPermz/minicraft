@@ -377,7 +377,10 @@ impl World {
         self.mark_dirty_around(x, z);
     }
 
-    /// 光をBFSで広げる。種は (x, y, z, レベル)。既存の光が強い場所では止まる
+    /// 光をBFSで広げる。種は (x, y, z, レベル)。既存の光が強い場所では止まる。
+    /// 隣へ流すセルは push と同時に set_light で確定させる。dequeue まで光を
+    /// 据え置くと未確定セルが `get_light+1 < lv` をすり抜けて何度も重複 enqueue され、
+    /// 開けた空間で pop 回数が指数的に膨張する(松明の再点灯が極端に遅くなる原因)。
     fn flood_add(&mut self, mut q: VecDeque<(i32, i32, i32, u8)>) {
         while let Some((x, y, z, lv)) = q.pop_front() {
             // 未生成チャンクには伝播しない(生成時に relight_chunk で流入させる)
@@ -391,6 +394,8 @@ impl World {
             if cur > lv {
                 continue;
             }
+            // 種(松明・再伝播の境界セル)の光がまだ点いていなければ点ける。
+            // cur == lv の再伝播の種はここを素通りして近傍へ展開する
             if cur < lv {
                 self.set_light(x, y, z, lv);
             }
@@ -401,6 +406,7 @@ impl World {
                 let (nx, ny, nz) = (x + dx, y + dy, z + dz);
                 if !self.get_block(nx, ny, nz).is_opaque() && self.get_light(nx, ny, nz) + 1 < lv
                 {
+                    self.set_light(nx, ny, nz, lv - 1);
                     q.push_back((nx, ny, nz, lv - 1));
                 }
             }
@@ -479,6 +485,11 @@ impl World {
         let mut touched = false;
         for (&(x, y, z), &b) in &self.edits {
             if x.div_euclid(CS) != cx || z.div_euclid(CS) != cz {
+                continue;
+            }
+            // idx() は範囲チェックをしない。edits は通常 set_block / 検証済み parse
+            // 由来で範囲内だが、万一の不正な y で配列範囲外 panic を起こさないよう弾く
+            if !(0..CH).contains(&y) {
                 continue;
             }
             c.blocks[idx(x.rem_euclid(CS), y, z.rem_euclid(CS))] = b;
