@@ -73,6 +73,8 @@ lsof -ti:8080 | xargs kill
 - **web/mq_js_bundle.js の quad_net プラグインは `register_plugin` を宣言なしのグローバル代入**で定義しており、strict 環境で `ReferenceError: register_plugin is not defined` になる → `var` 宣言+文の分離(カンマ式→セミコロン)にパッチ済み。バンドルを上流から更新したら再適用が必要
 - **wasmへのJS関数注入は index.html で `miniquad_add_plugin({register_plugin})` を `load()` より前に呼ぶ**。未登録でも add_missing_functions_stabs がスタブ化するので起動は失敗しない(セーブだけ無音で効かなくなる)
 - **flood_add の等値伝播**: BFS再伝播の種に「現在値と同じレベル」を渡す設計なので、`cur > lv` で continue(`>=` にすると境界からの再伝播が止まる)。未生成チャンクには伝播せず、生成時の relight_chunk で境界から流し込む
+- **flood_add は push と同時に set_light する(dequeue 据え置き厳禁)**: 光を dequeue 時にだけ書くと、enqueue 済みで未処理のセルが `get_light+1 < lv` をすり抜けて重複 enqueue され、開けた空間で pop 回数が指数的に膨張する(松明の再点灯が数十秒かかる原因だった)。隣へ流すセルは push 時に確定値を書き込み重複を断つ
+- **セーブの不正値は parse で弾く**: localStorage は手動書き換え・旧フォーマットが残り得る。`storage::parse` で `y∈0..CH` とブロックID(`<= FlowerYellow`)を検証し、不正行はスキップ。`idx()` は範囲チェックなしなので、範囲外 y を `apply_edits_to` に通すと起動時に配列範囲外 panic する(同関数にも防御ガードあり)
 
 ## 調整履歴
 - [2026-06-13] 葉・幹が真っ黒になる問題: heightsとAO遮蔽が葉を含んでいたため樹冠の下が「地下」扱いに → どちらも不透明ブロック限定に変更、AO_LUTも軟化 [0.48, 0.69, 0.85, 1.0]。修正後の見た目良好(docs/screenshot.png)
@@ -94,3 +96,4 @@ lsof -ti:8080 | xargs kill
 - [2026-06-13] 初回プレイテストのFB対応(v1.1)。不具合5件(深度2件は miniquad の depth_write 挙動が根本原因)+機能3件(R/V/M)。audio.rs 追加で9モジュール、wasm 588KB。ヘッドレスChromeで検証済み、実プレイ再確認待ち。
 - [2026-06-13] `cargo clippy --all-targets -- -D warnings` を警告ゼロに(既存コード含む16件: is_multiple_of / needless_range_loop / nonminimal_bool / too_many_arguments ほか)。mq_js_bundle.js の register_plugin ReferenceError をパッチ。
 - [2026-06-13] **v2完成**: 洞窟(3Dノイズ)・ライティング伝播(松明)・セーブ(localStorage)・草花を実装。storage.rs追加で10モジュール、wasm 624KB。ユニットテスト7本新設(初のテスト導入)、ヘッドレスChromeで3シーン検証(洞窟内松明・夜の松明・昼の草花)。実プレイ再確認待ち。
+- [2026-06-13] **コードレビュー指摘2件を修正**: (1) flood_add の光伝播を set-at-enqueue 化し、開けた空間での重複キュー指数爆発を解消(cargo test 59.5s→0.14s)。(2) storage::parse でセーブの y 範囲/ブロックIDを検証し、不正 localStorage による起動時 panic を防止(apply_edits_to にも防御ガード)。テスト8本に増、native/wasm 両 clippy 警告ゼロ維持。
