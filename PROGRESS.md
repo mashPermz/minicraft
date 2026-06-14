@@ -1,6 +1,6 @@
 # minicraft 作業メモ
 
-ブラウザで動く軽量マインクラフト風ゲーム(Rust製)。**v1 完成・動作確認済み。**
+ブラウザで動く軽量マインクラフト風ゲーム(Rust製)。**v2 完成(実プレイ確認待ち)。**
 
 リポジトリ: https://github.com/mashPermz/minicraft (private)
 
@@ -30,15 +30,18 @@ lsof -ti:8080 | xargs kill
 | BGM 再生 / 停止 | M |
 | 飛行モード切替 | F(Space上昇・Shift下降・Ctrl加速) |
 | 破壊 / 設置 | 左クリック / 右クリック(長押しで連続) |
-| ブロック選択 | 1〜9 またはホイール |
+| ブロック選択 | 1〜9 またはホイール(9番が松明) |
+| セーブ | P(60秒ごとに自動保存もあり、localStorage) |
+| 新規ワールド | N(マウス解放中のみ。セーブも消える) |
 | 描画距離 | - / =(3〜7チャンク) |
-| デバッグ表示 | Tab |
+| デバッグ表示 | Tab(光レベル表示あり) |
 | マウス解放 | Esc |
 
 ## 技術スタック(確定)
-- **Rust + macroquad 0.4.15**(miniquad 0.4.10)→ `wasm32-unknown-unknown` 直コンパイル。wasm-bindgen不要、**wasm 564KB**
+- **Rust + macroquad 0.4.15**(miniquad 0.4.10)→ `wasm32-unknown-unknown` 直コンパイル。wasm-bindgen不要、**wasm 624KB**
 - 配信物は `web/` の3ファイルのみ: index.html / mq_js_bundle.js / minicraft.wasm(静的サーバならどこでも動く)
-- グラフィック: カスタムGLSL(地形・水・雲の3マテリアル)+ プロシージャル生成テクスチャ(外部アセットゼロ)
+- グラフィック: カスタムGLSL(地形・水・雲の3マテリアル)+ プロシージャル生成テクスチャ(外部アセットゼロ、アトラス8x8タイル128px)
+- セーブ: index.html の `miniquad_add_plugin` で `ls_save/ls_size/ls_load/ls_clear` を importObject.env に注入 → Rust側 storage.rs の extern "C" から localStorage を読み書き(ネイティブテスト時は一時ファイルにフォールバック)
 
 ## 実装済み機能(v1)
 - 無限風地形: 16x96x16チャンク逐次生成、fBmパーリン(自作noise.rs)、バイオーム(草原/森/砂漠/雪)、海(SEA=36)、木(チャンク境界またぎ対応)、石炭鉱石
@@ -52,6 +55,14 @@ lsof -ti:8080 | xargs kill
 - 三人称視点(v1.1): Vで切替。後方カメラ(地形めり込みは後退距離をレイで制限)+歩行スイング付き簡易ブロックマン(player.rs draw_model)
 - パフォーマンス: フレーム予算式チャンク生成/メッシュ(通常3+2/フレーム)、粗い視錐台カリング、遠方チャンク破棄、u16インデックス上限で自動メッシュ分割
 
+## v2 で追加した機能
+- **洞窟**: 3Dパーリンノイズ2本(noise.rs perlin3)の交差判定 `world::cave_at`(両ノイズの2乗和 < 0.016)でスパゲッティ状トンネル。地中密度約7%。水没列は床下3ブロックを残して掘らない(浮き水防止)。木・スポーン・草花は洞窟入口の列を回避
+- **ライティング伝播(松明)**: チャンクごとに `light: Vec<u8>`(0..15)。設置で BFS拡散(TORCH_LIGHT=14、不透明ブロックで遮断)、破壊は減衰BFS除去+境界の他光源から再伝播。チャンク生成時は `relight_chunk` が自チャンクの光源点灯+隣接チャンク境界からの流入を処理。メッシュは頂点色 R=空光(AO・深さ陰影込み)/ G=松明光 の2チャンネルで焼き込み、シェーダで `LightColor*R + 暖色*G` 合成 → 夜でも松明は暖色で光る。深さ陰影の下限を 0.30→0.12 に下げて洞窟内を暗くした
+- **セーブ(localStorage)**: シード+プレイヤー状態+編集差分(`World::edits`)をテキスト形式("MC1"ヘッダ)で保存。P で手動、60秒ごと自動、起動時に自動ロード(チャンク生成時に `apply_edits_to` で差分再適用→松明再点灯)。N で新規ワールド(セーブ削除)
+- **草花**: TallGrass / FlowerRed / FlowerYellow。草ブロック上に約10%/1%/1%で生成。当たり判定なし・X字クロス描画(カリング無効前提の2枚板)・下のブロックを壊すと連鎖破壊(set_blockの needs_support 処理、編集差分にも記録)
+- **松明ブロック**: ホットバー9番(Dirtを外した)。クロス描画、下に固体ブロックが必要、非固体なのでプレイヤーと重なって設置可
+- ユニットテスト7本(cargo test、ネイティブ実行): ライト伝播/除去・チャンク跨ぎ再点灯・植物連鎖破壊・洞窟密度・編集差分再適用・セーブ往復/異常系
+
 ## ハマりポイント(重要)
 - **wasmリンクエラー `undefined symbol: glBindTexture`**: 新しいrustc(1.87+)はwasmの未定義シンボルをエラーにする。miniquadのGL関数はJS側から実行時注入される設計なので `.cargo/config.toml` で `-C link-arg=--allow-undefined` が必要(設定済み)
 - rustc 1.58→1.96更新時、旧`rls-preview`コンポーネントが`rustup update`を阻害 → `rustup component remove rls-preview`で解決
@@ -60,6 +71,10 @@ lsof -ti:8080 | xargs kill
 - **miniquad 0.4.10 は depth_write=false で深度テストごと無効化**(gl.rs の apply_pipeline が glDisable(GL_DEPTH_TEST) を呼ぶ)。半透明パイプラインでも depth_write=true にしないと、水・雲が手前の地形を無視して描かれる
 - **macroquad は1ドローコールあたり頂点10000/インデックス5000で黙ってクランプ**(QuadGl::geometry() が超過分を warn だけで切り捨て)。超えそうなメッシュは3200頂点で分割する(mesher.rs / sky.rs の Clouds)。`gl_set_drawcall_buffer_capacity` での拡大は、ドローコール毎にmaxサイズのGPUバッファが確保されるためメモリが膨らみ非推奨
 - **web/mq_js_bundle.js の quad_net プラグインは `register_plugin` を宣言なしのグローバル代入**で定義しており、strict 環境で `ReferenceError: register_plugin is not defined` になる → `var` 宣言+文の分離(カンマ式→セミコロン)にパッチ済み。バンドルを上流から更新したら再適用が必要
+- **wasmへのJS関数注入は index.html で `miniquad_add_plugin({register_plugin})` を `load()` より前に呼ぶ**。未登録でも add_missing_functions_stabs がスタブ化するので起動は失敗しない(セーブだけ無音で効かなくなる)
+- **flood_add の等値伝播**: BFS再伝播の種に「現在値と同じレベル」を渡す設計なので、`cur > lv` で continue(`>=` にすると境界からの再伝播が止まる)。未生成チャンクには伝播せず、生成時の relight_chunk で境界から流し込む
+- **flood_add は push と同時に set_light する(dequeue 据え置き厳禁)**: 光を dequeue 時にだけ書くと、enqueue 済みで未処理のセルが `get_light+1 < lv` をすり抜けて重複 enqueue され、開けた空間で pop 回数が指数的に膨張する(松明の再点灯が数十秒かかる原因だった)。隣へ流すセルは push 時に確定値を書き込み重複を断つ
+- **セーブの不正値は parse で弾く**: localStorage は手動書き換え・旧フォーマットが残り得る。`storage::parse` で `y∈0..CH` とブロックID(`<= FlowerYellow`)を検証し、不正行はスキップ。`idx()` は範囲チェックなしなので、範囲外 y を `apply_edits_to` に通すと起動時に配列範囲外 panic する(同関数にも防御ガードあり)
 
 ## 調整履歴
 - [2026-06-13] 葉・幹が真っ黒になる問題: heightsとAO遮蔽が葉を含んでいたため樹冠の下が「地下」扱いに → どちらも不透明ブロック限定に変更、AO_LUTも軟化 [0.48, 0.69, 0.85, 1.0]。修正後の見た目良好(docs/screenshot.png)
@@ -68,12 +83,17 @@ lsof -ti:8080 | xargs kill
 ## 検証状況
 - ✅ ヘッドレスChrome(SwiftShader)でスクリーンショット検証: 草原・森・砂漠・雲・AO・空・ホットバー・ロード画面(docs/に保存)
 - ✅ FB対応分のスクリーンショット検証: 四角い太陽・雲が木の奥に描画・三人称モデル・海岸のレイヤリング
+- ✅ v2スクリーンショット検証(evidence_of_tests/): v2_cave_torch.png(洞窟内の松明光と減衰)・v2_night_torches.png(夜の地上、松明の暖色プール+草花)・v2_flowers_day.png(昼の草原に花・草、新ホットバー)
+- ✅ v2ロジック検証: cargo test 7本(ライト伝播・セーブ往復・洞窟密度ほか)+ clippy 警告ゼロ(wasm/native両ターゲット)
 - ⬜ 実ブラウザでの操作系(岸ジャンプ・BGM・ダッシュ切替・三人称、実GPUでのFPS)→ 人間の実プレイで再確認待ち
+- ⬜ v2の実プレイ確認: 洞窟探検・松明設置/破壊・P/Nキー・リロードでセーブ復元・草花の見た目
 
-## v2候補(見送り分)
-- 洞窟(3Dノイズ)、ライティング伝播(松明)、セーブ(localStorage)、音、ガラス以外の追加ブロック、水流、モブ、フルスクリーンボタン、モバイル対応(タッチ)
+## v3候補(見送り分)
+- 音(効果音)、追加ブロック、水流、モブ、フルスクリーンボタン、モバイル対応(タッチ)、スカイライト本実装(現状は深さ陰影で近似)、松明の壁掛け設置
 
 ## 作業ログ
 - [2026-06-13] 開始。Rust 1.96更新、設計、全8モジュール実装(~1900行)、wasmビルド成功(564KB)、ヘッドレスChromeで描画検証、葉の暗さ修正。v1完成。
 - [2026-06-13] 初回プレイテストのFB対応(v1.1)。不具合5件(深度2件は miniquad の depth_write 挙動が根本原因)+機能3件(R/V/M)。audio.rs 追加で9モジュール、wasm 588KB。ヘッドレスChromeで検証済み、実プレイ再確認待ち。
 - [2026-06-13] `cargo clippy --all-targets -- -D warnings` を警告ゼロに(既存コード含む16件: is_multiple_of / needless_range_loop / nonminimal_bool / too_many_arguments ほか)。mq_js_bundle.js の register_plugin ReferenceError をパッチ。
+- [2026-06-13] **v2完成**: 洞窟(3Dノイズ)・ライティング伝播(松明)・セーブ(localStorage)・草花を実装。storage.rs追加で10モジュール、wasm 624KB。ユニットテスト7本新設(初のテスト導入)、ヘッドレスChromeで3シーン検証(洞窟内松明・夜の松明・昼の草花)。実プレイ再確認待ち。
+- [2026-06-13] **コードレビュー指摘2件を修正**: (1) flood_add の光伝播を set-at-enqueue 化し、開けた空間での重複キュー指数爆発を解消(cargo test 59.5s→0.14s)。(2) storage::parse でセーブの y 範囲/ブロックIDを検証し、不正 localStorage による起動時 panic を防止(apply_edits_to にも防御ガード)。テスト8本に増、native/wasm 両 clippy 警告ゼロ維持。

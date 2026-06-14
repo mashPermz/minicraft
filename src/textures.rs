@@ -1,10 +1,10 @@
 // プロシージャル生成テクスチャアトラス(外部アセット不要)
-// 4x4タイル、各16x16px → 64x64
+// 8x8タイル、各16x16px → 128x128
 
 use crate::noise::{hash01, hash_u32};
 use macroquad::prelude::*;
 
-pub const ATLAS_TILES: u32 = 4;
+pub const ATLAS_TILES: u32 = 8;
 pub const TILE_PX: u32 = 16;
 pub const ATLAS_PX: u32 = ATLAS_TILES * TILE_PX;
 
@@ -184,11 +184,72 @@ fn coal(x: u32, y: u32) -> Color {
     }
 }
 
+fn torch(x: u32, y: u32) -> Color {
+    // 中央の柄 + 先端の炎(まわりは透明)
+    if (7..=8).contains(&x) && (6..16).contains(&y) {
+        let n = (px_noise(x, y, 121) * 16.0 - 8.0) as i32;
+        let c = |v: i32| (v + n).clamp(0, 255) as u8;
+        rgba(c(120), c(92), c(56), 255)
+    } else if (7..=8).contains(&x) && (2..=3).contains(&y) {
+        rgba(255, 236, 140, 255) // 炎の芯
+    } else if (6..=9).contains(&x) && (3..=5).contains(&y) {
+        rgba(244, 160, 54, 255) // 炎の外側
+    } else {
+        rgba(0, 0, 0, 0)
+    }
+}
+
+fn tall_grass(x: u32, y: u32) -> Color {
+    // 高さの違う草の葉が縦に並ぶ(列ごとに有無と高さを決める)
+    if px_noise(x, 1, 132) < 0.32 {
+        return rgba(0, 0, 0, 0);
+    }
+    let top = 4 + (px_noise(x, 0, 131) * 8.0) as u32;
+    if y < top {
+        return rgba(0, 0, 0, 0);
+    }
+    let n = px_noise(x, y, 133);
+    if n > 0.6 {
+        rgba(96, 160, 66, 255)
+    } else {
+        rgba(74, 134, 52, 255)
+    }
+}
+
+/// 茎 + 花弁(花弁色と芯色を指定)
+fn flower(x: u32, y: u32, petal: (u8, u8, u8), core: (u8, u8, u8)) -> Color {
+    let (cx, cy) = (7i32, 4i32);
+    let dx = x as i32 - cx;
+    let dy = y as i32 - cy;
+    if dx.abs() <= 1 && dy.abs() <= 1 && dx.abs() + dy.abs() <= 1 {
+        return rgba(core.0, core.1, core.2, 255);
+    }
+    if dx.abs() + dy.abs() <= 3 && dx.abs() <= 2 && dy.abs() <= 2 {
+        return rgba(petal.0, petal.1, petal.2, 255);
+    }
+    // 茎と葉
+    if x == 7 && (7..16).contains(&y) {
+        return rgba(58, 118, 44, 255);
+    }
+    if y == 10 && (5..=6).contains(&x) {
+        return rgba(74, 138, 52, 255);
+    }
+    rgba(0, 0, 0, 0)
+}
+
+fn flower_red(x: u32, y: u32) -> Color {
+    flower(x, y, (208, 54, 46), (244, 200, 90))
+}
+
+fn flower_yellow(x: u32, y: u32) -> Color {
+    flower(x, y, (236, 198, 60), (170, 120, 36))
+}
+
 type TileFn = fn(u32, u32) -> Color;
 
 pub fn build_atlas() -> Texture2D {
-    let mut img = Image::gen_image_color(ATLAS_PX as u16, ATLAS_PX as u16, WHITE);
-    let tiles: [(u32, u32, TileFn); 15] = [
+    let mut img = Image::gen_image_color(ATLAS_PX as u16, ATLAS_PX as u16, BLANK);
+    let tiles: [(u32, u32, TileFn); 19] = [
         (0, 0, grass_top),
         (1, 0, grass_side),
         (2, 0, |x, y| dirt(x, y, 12)),
@@ -204,6 +265,10 @@ pub fn build_atlas() -> Texture2D {
         (0, 3, cobble),
         (1, 3, glass),
         (2, 3, coal),
+        (3, 3, torch),
+        (4, 0, tall_grass),
+        (5, 0, flower_red),
+        (6, 0, flower_yellow),
     ];
     for (tx, ty, f) in tiles {
         for py in 0..TILE_PX {

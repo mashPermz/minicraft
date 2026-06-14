@@ -6,6 +6,7 @@ mod mesher;
 mod noise;
 mod player;
 mod sky;
+mod storage;
 mod textures;
 mod world;
 
@@ -40,6 +41,8 @@ void main() {
 }
 "#;
 
+// 頂点色: R=空光の明るさ(AO・深さ込み) G=松明光。昼夜のLightColorはRのみに掛かり、
+// 松明の暖色光は夜でも一定の明るさを保つ
 const TERRAIN_FS: &str = r#"#version 100
 precision mediump float;
 varying lowp vec4 vcolor;
@@ -51,7 +54,8 @@ uniform vec3 LightColor;
 void main() {
     vec4 t = texture2D(Texture, vuv);
     if (t.a < 0.5) discard;
-    vec3 c = t.rgb * vcolor.rgb * LightColor;
+    vec3 lit = LightColor * vcolor.r + vec3(1.0, 0.82, 0.55) * (vcolor.g * 1.15);
+    vec3 c = t.rgb * min(lit, vec3(1.25));
     gl_FragColor = vec4(mix(c, FogColor, vfog), 1.0);
 }
 "#;
@@ -93,7 +97,8 @@ uniform vec3 FogColor;
 uniform vec3 LightColor;
 void main() {
     vec4 t = texture2D(Texture, vuv);
-    vec3 c = t.rgb * vcolor.rgb * LightColor;
+    vec3 lit = LightColor * vcolor.r + vec3(1.0, 0.82, 0.55) * vcolor.g;
+    vec3 c = t.rgb * min(lit, vec3(1.25));
     gl_FragColor = vec4(mix(c, FogColor, vfog), 0.62 * (1.0 - vfog * 0.6));
 }
 "#;
@@ -210,12 +215,12 @@ fn make_materials() -> (Material, Material, Material) {
     (terrain, water, cloud)
 }
 
-/// 海より上の地表となるスポーン地点を探す
+/// 海より上の地表(洞窟の入口でない場所)となるスポーン地点を探す
 fn find_spawn(seed: u32) -> (i32, i32) {
     for r in 0..64 {
         for (x, z) in [(r * 8, 0), (-r * 8, r * 4), (r * 4, -r * 8), (0, r * 8)] {
             let (h, _) = world::surface(seed, x, z);
-            if h > SEA + 1 && h < 60 {
+            if h > SEA + 1 && h < 60 && !world::cave_at(seed, x, h, z) {
                 return (x, z);
             }
         }
@@ -248,8 +253,10 @@ fn update_chunks(
     let mut pending = 0;
     for &(_, cx, cz) in &want {
         if gen_budget > 0 {
-            let c = world::generate_chunk(w.seed, cx, cz);
+            let mut c = world::generate_chunk(w.seed, cx, cz);
+            w.apply_edits_to(&mut c, cx, cz); // セーブされた編集差分を反映
             w.chunks.insert((cx, cz), c);
+            w.relight_chunk(cx, cz); // チャンク内の松明と隣接からの光を流し込む
             gen_budget -= 1;
         } else {
             pending += 1;
@@ -288,17 +295,52 @@ fn update_chunks(
     pending
 }
 
+/// 現在の状態をセーブ文字列にする
+fn save_now(seed: u32, player: &Player, w: &World) -> String {
+    storage::serialize(&storage::SaveData {
+        seed,
+        pos: player.pos,
+        yaw: player.yaw,
+        pitch: player.pitch,
+        fly: player.fly,
+        run_mode: player.run_mode,
+        edits: w.edits.clone(),
+    })
+}
+
+/// 新規ワールド一式(World, プレイヤー, スポーン列)
+fn new_world(seed: u32) -> (World, Player, i32, i32) {
+    let w = World::new(seed);
+    let (sx, sz) = find_spawn(seed);
+    let (sh, _) = world::surface(seed, sx, sz);
+    let player = Player::new(vec3(sx as f32 + 0.5, sh as f32 + 2.0, sz as f32 + 0.5));
+    (w, player, sx, sz)
+}
+
 #[macroquad::main(conf)]
 async fn main() {
-    let seed = (macroquad::miniquad::date::now() as u32) | 1;
+    let mut seed = (macroquad::miniquad::date::now() as u32) | 1;
     let atlas = textures::build_atlas();
     let (terrain_mat, water_mat, cloud_mat) = make_materials();
     let bgm = audio::load_bgm().await;
 
-    let mut w = World::new(seed);
-    let (sx, sz) = find_spawn(seed);
-    let (sh, _) = world::surface(seed, sx, sz);
-    let mut player = Player::new(vec3(sx as f32 + 0.5, sh as f32 + 2.0, sz as f32 + 0.5));
+    // セーブがあれば再開(シード・編集差分・プレイヤー位置を復元)
+    let saved = storage::load().and_then(|s| storage::parse(&s));
+    let mut fresh_spawn = saved.is_none();
+    let (mut w, mut player, mut sx, mut sz) = match saved {
+        Some(d) => {
+            seed = d.seed;
+            let mut w = World::new(seed);
+            w.edits = d.edits;
+            let mut player = Player::new(d.pos);
+            player.yaw = d.yaw;
+            player.pitch = d.pitch;
+            player.fly = d.fly;
+            player.run_mode = d.run_mode;
+            (w, player, d.pos.x.floor() as i32, d.pos.z.floor() as i32)
+        }
+        None => new_world(seed),
+    };
     let mut clouds = sky::Clouds::new(seed);
 
     let mut radius: i32 = 4;
@@ -311,6 +353,8 @@ async fn main() {
     let mut frame_no: u64 = 0;
     let mut third_person = false;
     let mut bgm_on = false;
+    let mut last_save = get_time();
+    let mut toast: (String, f32) = (String::new(), 0.0);
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -324,8 +368,10 @@ async fn main() {
         let pending = update_chunks(&mut w, &atlas, pcx, pcz, radius, gb, mb);
         let total = (2 * radius + 1) * (2 * radius + 1);
         if !ready && pending == 0 {
-            // 地表(木を含む)の上に立たせる
-            player.pos.y = w.height_at(sx, sz) as f32 + 1.01;
+            if fresh_spawn {
+                // 地表(木を含む)の上に立たせる(セーブ再開時は保存位置のまま)
+                player.pos.y = w.height_at(sx, sz) as f32 + 1.01;
+            }
             player.vel = Vec3::ZERO;
             ready = true;
         }
@@ -379,6 +425,27 @@ async fn main() {
                     stop_sound(s);
                 }
             }
+        }
+
+        // --- セーブ(P / 60秒ごとの自動保存)と新規ワールド(Nはメニュー中のみ) ---
+        if ready && is_key_pressed(KeyCode::P) {
+            storage::save(&save_now(seed, &player, &w));
+            last_save = time;
+            toast = ("SAVED".to_string(), 2.0);
+        }
+        if ready && time - last_save > 60.0 {
+            storage::save(&save_now(seed, &player, &w));
+            last_save = time;
+            toast = ("AUTO SAVE".to_string(), 1.2);
+        }
+        if ready && !grabbed && is_key_pressed(KeyCode::N) {
+            storage::clear();
+            seed = (macroquad::miniquad::date::now() as u32) | 1;
+            (w, player, sx, sz) = new_world(seed);
+            clouds = sky::Clouds::new(seed);
+            ready = false;
+            fresh_spawn = true;
+            toast = ("NEW WORLD".to_string(), 2.0);
         }
 
         // --- ホットバー選択 ---
@@ -447,9 +514,15 @@ async fn main() {
                     edit_cd = 0.22;
                 } else if place_now && n != IVec3::ZERO {
                     let pp = bp + n;
-                    if w.get_block(pp.x, pp.y, pp.z).replaceable() && !player.intersects_block(pp)
+                    let nb = HOTBAR[sel];
+                    // 松明・草花は下に固体ブロックが必要。非固体は体と重なってもよい
+                    let support_ok =
+                        !nb.needs_support() || w.get_block(pp.x, pp.y - 1, pp.z).is_solid();
+                    if w.get_block(pp.x, pp.y, pp.z).replaceable()
+                        && support_ok
+                        && (!nb.is_solid() || !player.intersects_block(pp))
                     {
-                        w.set_block(pp.x, pp.y, pp.z, HOTBAR[sel]);
+                        w.set_block(pp.x, pp.y, pp.z, nb);
                         edit_cd = 0.22;
                     }
                 }
@@ -652,6 +725,19 @@ async fn main() {
             );
         }
 
+        // セーブ等の通知
+        if toast.1 > 0.0 {
+            toast.1 -= dt;
+            let m = measure_text(&toast.0, None, 26, 1.0);
+            draw_text(
+                &toast.0,
+                (sw - m.width) / 2.0,
+                y0 - 18.0,
+                26.0,
+                Color::new(1.0, 1.0, 1.0, toast.1.min(1.0)),
+            );
+        }
+
         // デバッグ表示
         if show_debug {
             let lines = [
@@ -660,7 +746,16 @@ async fn main() {
                     "pos: {:.1} {:.1} {:.1}  chunk: {} {}",
                     player.pos.x, player.pos.y, player.pos.z, pcx, pcz
                 ),
-                format!("chunks: {}  tris: {}k", w.chunks.len(), tri_count / 1000),
+                format!(
+                    "chunks: {}  tris: {}k  light: {}",
+                    w.chunks.len(),
+                    tri_count / 1000,
+                    w.get_light(
+                        player.pos.x.floor() as i32,
+                        (player.pos.y + 0.5).floor() as i32,
+                        player.pos.z.floor() as i32
+                    )
+                ),
                 format!(
                     "radius: {} (-/= to change)  fly: {}  run: {}  view: {}",
                     radius,
@@ -686,7 +781,7 @@ async fn main() {
                 ("Click to play", 24.0),
                 ("WASD: move  Space: jump  F: fly  Shift: sprint  R: run", 18.0),
                 ("L-click: break  R-click: place  1-9 / wheel: select", 18.0),
-                ("V: view  M: music  Tab: debug  Esc: release mouse", 18.0),
+                ("V: view  M: music  P: save  N: new world  Tab: debug", 18.0),
             ];
             let mut ty = py + 44.0;
             for (l, size) in lines {

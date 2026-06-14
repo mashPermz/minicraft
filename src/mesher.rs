@@ -1,5 +1,5 @@
 // チャンクメッシュ生成: 隣接面カリング + 頂点AO + 面方向の陰影 + 深さ陰影
-// 頂点色に明るさを焼き込み、シェーダ側でフォグと全体光を掛ける
+// 頂点色のRに空光の明るさ、Gに松明光を焼き込み、シェーダ側で合成する
 
 use crate::blocks::Block;
 use crate::textures::tile_uv;
@@ -11,6 +11,7 @@ const SNAP: i32 = CS + 2; // 周囲1ブロックを含むスナップショッ�
 
 struct Snapshot {
     blocks: Vec<u8>,
+    light: Vec<u8>,
     heights: Vec<i16>,
 }
 
@@ -27,6 +28,15 @@ impl Snapshot {
         Block::from_u8(self.blocks[((((lx + 1) * SNAP) + (lz + 1)) * CH + y) as usize])
     }
 
+    /// ブロック光(松明)0..15
+    #[inline]
+    fn light(&self, lx: i32, y: i32, lz: i32) -> u8 {
+        if !(0..CH).contains(&y) {
+            return 0;
+        }
+        self.light[((((lx + 1) * SNAP) + (lz + 1)) * CH + y) as usize]
+    }
+
     #[inline]
     fn height(&self, lx: i32, lz: i32) -> i32 {
         self.heights[(((lx + 1) * SNAP) + (lz + 1)) as usize] as i32
@@ -35,6 +45,7 @@ impl Snapshot {
 
 fn snapshot(world: &World, cx: i32, cz: i32) -> Snapshot {
     let mut blocks = vec![0u8; (SNAP * SNAP * CH) as usize];
+    let mut light = vec![0u8; (SNAP * SNAP * CH) as usize];
     let mut heights = vec![0i16; (SNAP * SNAP) as usize];
     for sx in -1..=CS {
         for sz in -1..=CS {
@@ -48,11 +59,16 @@ fn snapshot(world: &World, cx: i32, cz: i32) -> Snapshot {
             let dst = ((((sx + 1) * SNAP) + (sz + 1)) * CH) as usize;
             for y in 0..CH {
                 blocks[dst + y as usize] = c.get(lx, y, lz) as u8;
+                light[dst + y as usize] = c.light_at(lx, y, lz);
             }
             heights[(((sx + 1) * SNAP) + (sz + 1)) as usize] = c.height(lx, lz) as i16;
         }
     }
-    Snapshot { blocks, heights }
+    Snapshot {
+        blocks,
+        light,
+        heights,
+    }
 }
 
 // 面定義: 法線、4頂点オフセット(反時計回り)、陰影
@@ -84,7 +100,14 @@ impl Bufs {
         }
     }
 
-    fn quad(&mut self, corners: [Vec3; 4], uvs: [(f32, f32); 4], bright: [f32; 4], flip: bool) {
+    fn quad(
+        &mut self,
+        corners: [Vec3; 4],
+        uvs: [(f32, f32); 4],
+        sky: [f32; 4],
+        torch: [f32; 4],
+        flip: bool,
+    ) {
         // macroquadは1ドローコールあたり頂点10000/インデックス5000で黙って
         // クランプする(超過分の面が欠落する)ため、その内側で分割する
         if self.v.len() + 4 > 3200 {
@@ -92,11 +115,12 @@ impl Bufs {
         }
         let base = self.v.len() as u16;
         for k in 0..4 {
-            let c = (bright[k].clamp(0.0, 1.0) * 255.0) as u8;
+            let s = (sky[k].clamp(0.0, 1.0) * 255.0) as u8;
+            let t = (torch[k].clamp(0.0, 1.0) * 255.0) as u8;
             self.v.push(Vertex {
                 position: corners[k],
                 uv: vec2(uvs[k].0, uvs[k].1),
-                color: [c, c, c, 255],
+                color: [s, t, 0, 255],
                 normal: Vec4::ZERO,
             });
         }
@@ -125,8 +149,9 @@ fn occ(snap: &Snapshot, x: i32, y: i32, z: i32) -> bool {
     snap.get(x, y, z).is_opaque()
 }
 
-/// 面の4頂点ぶんのAO係数を返す
-fn face_ao(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> [f32; 4] {
+/// 面の4頂点ぶんのAO係数と松明光(0..1)を返す。
+/// 光は頂点を囲む面上の4セル(不透明セルを除く)の平均でなめらかにする
+fn face_ao_light(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> ([f32; 4], [f32; 4]) {
     let (n, corners, _) = FACES[f];
     let naxis = if n[0] != 0 { 0 } else if n[1] != 0 { 1 } else { 2 };
     let (t1, t2) = match naxis {
@@ -136,6 +161,7 @@ fn face_ao(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> [f32; 4] {
     };
     let base = [lx + n[0], y + n[1], lz + n[2]];
     let mut ao = [1.0f32; 4];
+    let mut tl = [0.0f32; 4];
     for k in 0..4 {
         let c = corners[k];
         let d1 = c[t1] * 2 - 1;
@@ -156,8 +182,18 @@ fn face_ao(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> [f32; 4] {
             3 - (s1 + s2 + sc)
         };
         ao[k] = AO_LUT[level];
+
+        let mut lsum = snap.light(base[0], base[1], base[2]) as f32;
+        let mut lcnt = 1.0f32;
+        for (p, occluded) in [(p1, s1 == 1), (p2, s2 == 1), (pc, sc == 1)] {
+            if !occluded {
+                lsum += snap.light(p[0], p[1], p[2]) as f32;
+                lcnt += 1.0;
+            }
+        }
+        tl[k] = lsum / lcnt / 15.0;
     }
-    ao
+    (ao, tl)
 }
 
 fn face_uvs(f: usize, tile: (u32, u32)) -> [(f32, f32); 4] {
@@ -176,10 +212,11 @@ fn face_uvs(f: usize, tile: (u32, u32)) -> [(f32, f32); 4] {
     uvs
 }
 
-/// 地表からの深さによる暗さ(掘った穴や張り出しの下を暗く)
+/// 地表からの深さによる暗さ(掘った穴や張り出しの下を暗く)。
+/// 洞窟の奥はかなり暗くなるので、明るくしたければ松明を置く
 fn depth_light(snap: &Snapshot, ax: i32, ay: i32, az: i32) -> f32 {
     let depth = snap.height(ax, az) - ay;
-    (1.0 - 0.12 * depth.max(0) as f32).clamp(0.30, 1.0)
+    (1.0 - 0.12 * depth.max(0) as f32).clamp(0.12, 1.0)
 }
 
 /// 不透明メッシュと水メッシュを生成
@@ -206,24 +243,31 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
                     continue;
                 }
 
+                if b.is_cross() {
+                    emit_cross(&snap, &mut solid, b, lx, y, lz, vec3(px, py, pz));
+                    continue;
+                }
+
                 for (f, &(n, corners, shade)) in FACES.iter().enumerate() {
                     let nb = snap.get(lx + n[0], y + n[1], lz + n[2]);
                     let hidden = nb.is_opaque() || (nb == b && b.merges());
                     if hidden {
                         continue;
                     }
-                    let ao = face_ao(&snap, lx, y, lz, f);
+                    let (ao, tl) = face_ao_light(&snap, lx, y, lz, f);
                     let dl = depth_light(&snap, lx + n[0], y + n[1], lz + n[2]);
                     let uvs = face_uvs(f, b.tile(f));
                     let mut cs4 = [Vec3::ZERO; 4];
-                    let mut br = [0.0f32; 4];
+                    let mut sky = [0.0f32; 4];
+                    let mut torch = [0.0f32; 4];
                     for k in 0..4 {
                         let c = corners[k];
                         cs4[k] = vec3(px + c[0] as f32, py + c[1] as f32, pz + c[2] as f32);
-                        br[k] = shade * ao[k] * dl;
+                        sky[k] = shade * ao[k] * dl;
+                        torch[k] = tl[k] * ao[k];
                     }
                     let flip = ao[0] + ao[2] < ao[1] + ao[3];
-                    solid.quad(cs4, uvs, br, flip);
+                    solid.quad(cs4, uvs, sky, torch, flip);
                 }
             }
         }
@@ -234,9 +278,29 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
     (solid.out, water.out)
 }
 
+/// 松明・草花: 対角に交差する2枚の板(両面描画はカリング無効が前提)
+fn emit_cross(snap: &Snapshot, bufs: &mut Bufs, b: Block, lx: i32, y: i32, lz: i32, p: Vec3) {
+    let dl = depth_light(snap, lx, y, lz);
+    let tl = snap.light(lx, y, lz) as f32 / 15.0;
+    let (u0, v0, u1, v1) = tile_uv(b.tile(2));
+    let uvs = [(u0, v1), (u1, v1), (u1, v0), (u0, v0)];
+    const A: f32 = 0.15;
+    const B: f32 = 0.85;
+    for (z0, z1) in [(A, B), (B, A)] {
+        let c = [
+            vec3(p.x + A, p.y, p.z + z0),
+            vec3(p.x + B, p.y, p.z + z1),
+            vec3(p.x + B, p.y + 1.0, p.z + z1),
+            vec3(p.x + A, p.y + 1.0, p.z + z0),
+        ];
+        bufs.quad(c, uvs, [dl; 4], [tl; 4], false);
+    }
+}
+
 fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec3) {
     let above = snap.get(lx, y + 1, lz);
     let top_h = if above == Block::Water { 1.0 } else { 0.85 };
+    let tl = snap.light(lx, y, lz) as f32 / 15.0;
 
     // 上面
     if above != Block::Water && !above.is_opaque() {
@@ -247,7 +311,7 @@ fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec
             vec3(p.x + 1.0, p.y + top_h, p.z + 1.0),
             vec3(p.x + 1.0, p.y + top_h, p.z),
         ];
-        bufs.quad(c, uvs, [1.0; 4], false);
+        bufs.quad(c, uvs, [1.0; 4], [tl; 4], false);
     }
 
     // 側面(水でも不透明でもない隣に対して)
@@ -263,6 +327,6 @@ fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec
             let cy = if c[1] == 1 { top_h } else { 0.0 };
             cs4[k] = vec3(p.x + c[0] as f32, p.y + cy, p.z + c[2] as f32);
         }
-        bufs.quad(cs4, uvs, [shade; 4], false);
+        bufs.quad(cs4, uvs, [shade; 4], [tl; 4], false);
     }
 }
