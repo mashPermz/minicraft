@@ -1,8 +1,8 @@
 # minicraft 作業メモ
 
-ブラウザで動く軽量マインクラフト風ゲーム(Rust製)。**v2 完成(実プレイ確認待ち)。**
+ブラウザで動く軽量マインクラフト風ゲーム(Rust製)。**v2 完成。**
 
-リポジトリ: https://github.com/mashPermz/minicraft (private)
+リポジトリ: https://github.com/mashPermz/minicraft
 
 ## 遊び方
 
@@ -22,28 +22,30 @@ cd minicraft
 lsof -ti:8080 | xargs kill
 ```
 
-| 操作 | キー |
-|---|---|
-| 移動 / ジャンプ | WASD / Space |
-| ダッシュ | Shift(前進中)/ R で持続ダッシュ切替 |
-| 視点切替(一人称/三人称) | V |
-| BGM 再生 / 停止 | M |
-| 飛行モード切替 | F(Space上昇・Shift下降・Ctrl加速) |
-| 破壊 / 設置 | 左クリック / 右クリック(長押しで連続) |
-| ブロック選択 | 1〜9 またはホイール(9番が松明) |
-| セーブ | P(60秒ごとに自動保存もあり、localStorage) |
-| 新規ワールド | N(マウス解放中のみ。セーブも消える) |
-| 描画距離 | - / =(3〜7チャンク) |
-| デバッグ表示 | Tab(光レベル表示あり) |
-| マウス解放 | Esc |
+| 操作                    | キー                                      |
+| ----------------------- | ----------------------------------------- |
+| 移動 / ジャンプ         | WASD / Space                              |
+| ダッシュ                | Shift(前進中)/ R で持続ダッシュ切替       |
+| 視点切替(一人称/三人称) | V                                         |
+| BGM 再生 / 停止         | M                                         |
+| 飛行モード切替          | F(Space上昇・Shift下降・Ctrl加速)         |
+| 破壊 / 設置             | 左クリック / 右クリック(長押しで連続)     |
+| ブロック選択            | 1〜9 またはホイール(9番が松明)            |
+| セーブ                  | P(60秒ごとに自動保存もあり、localStorage) |
+| 新規ワールド            | N(マウス解放中のみ。セーブも消える)       |
+| 描画距離                | - / =(3〜7チャンク)                       |
+| デバッグ表示            | Tab(光レベル表示あり)                     |
+| マウス解放              | Esc                                       |
 
 ## 技術スタック(確定)
+
 - **Rust + macroquad 0.4.15**(miniquad 0.4.10)→ `wasm32-unknown-unknown` 直コンパイル。wasm-bindgen不要、**wasm 624KB**
 - 配信物は `web/` の3ファイルのみ: index.html / mq_js_bundle.js / minicraft.wasm(静的サーバならどこでも動く)
 - グラフィック: カスタムGLSL(地形・水・雲の3マテリアル)+ プロシージャル生成テクスチャ(外部アセットゼロ、アトラス8x8タイル128px)
 - セーブ: index.html の `miniquad_add_plugin` で `ls_save/ls_size/ls_load/ls_clear` を importObject.env に注入 → Rust側 storage.rs の extern "C" から localStorage を読み書き(ネイティブテスト時は一時ファイルにフォールバック)
 
 ## 実装済み機能(v1)
+
 - 無限風地形: 16x96x16チャンク逐次生成、fBmパーリン(自作noise.rs)、バイオーム(草原/森/砂漠/雪)、海(SEA=36)、木(チャンク境界またぎ対応)、石炭鉱石
 - 描画: 隣接面カリング+**頂点AO**(フリップ補正付き)+面方向陰影+**深さ陰影**(掘った穴が暗くなる。列高さheightsを不透明ブロックのみで管理)
 - 距離フォグ(水平距離基準)、**昼夜サイクル600秒**(空色・光色・朝夕の赤み)、空グラデーション(ピッチ連動)、太陽・月、**流れる雲レイヤー**(y=100、ドリフトはシームレス)
@@ -56,6 +58,7 @@ lsof -ti:8080 | xargs kill
 - パフォーマンス: フレーム予算式チャンク生成/メッシュ(通常3+2/フレーム)、粗い視錐台カリング、遠方チャンク破棄、u16インデックス上限で自動メッシュ分割
 
 ## v2 で追加した機能
+
 - **洞窟**: 3Dパーリンノイズ2本(noise.rs perlin3)の交差判定 `world::cave_at`(両ノイズの2乗和 < 0.016)でスパゲッティ状トンネル。地中密度約7%。水没列は床下3ブロックを残して掘らない(浮き水防止)。木・スポーン・草花は洞窟入口の列を回避
 - **ライティング伝播(松明)**: チャンクごとに `light: Vec<u8>`(0..15)。設置で BFS拡散(TORCH_LIGHT=14、不透明ブロックで遮断)、破壊は減衰BFS除去+境界の他光源から再伝播。チャンク生成時は `relight_chunk` が自チャンクの光源点灯+隣接チャンク境界からの流入を処理。メッシュは頂点色 R=空光(AO・深さ陰影込み)/ G=松明光 の2チャンネルで焼き込み、シェーダで `LightColor*R + 暖色*G` 合成 → 夜でも松明は暖色で光る。深さ陰影の下限を 0.30→0.12 に下げて洞窟内を暗くした
 - **セーブ(localStorage)**: シード+プレイヤー状態+編集差分(`World::edits`)をテキスト形式("MC1"ヘッダ)で保存。P で手動、60秒ごと自動、起動時に自動ロード(チャンク生成時に `apply_edits_to` で差分再適用→松明再点灯)。N で新規ワールド(セーブ削除)
@@ -64,6 +67,7 @@ lsof -ti:8080 | xargs kill
 - ユニットテスト7本(cargo test、ネイティブ実行): ライト伝播/除去・チャンク跨ぎ再点灯・植物連鎖破壊・洞窟密度・編集差分再適用・セーブ往復/異常系
 
 ## ハマりポイント(重要)
+
 - **wasmリンクエラー `undefined symbol: glBindTexture`**: 新しいrustc(1.87+)はwasmの未定義シンボルをエラーにする。miniquadのGL関数はJS側から実行時注入される設計なので `.cargo/config.toml` で `-C link-arg=--allow-undefined` が必要(設定済み)
 - rustc 1.58→1.96更新時、旧`rls-preview`コンポーネントが`rustup update`を阻害 → `rustup component remove rls-preview`で解決
 - macroquadのAPI確認は `~/.cargo/registry/src/*/macroquad-0.4.15/` のソースをgrepするのが確実(Vertex.colorは`[u8;4]`、Camera3Dのfovyはラジアン、upのデフォルトは+Z軸なので要指定)
@@ -77,10 +81,12 @@ lsof -ti:8080 | xargs kill
 - **セーブの不正値は parse で弾く**: localStorage は手動書き換え・旧フォーマットが残り得る。`storage::parse` で `y∈0..CH` とブロックID(`<= FlowerYellow`)を検証し、不正行はスキップ。`idx()` は範囲チェックなしなので、範囲外 y を `apply_edits_to` に通すと起動時に配列範囲外 panic する(同関数にも防御ガードあり)
 
 ## 調整履歴
+
 - [2026-06-13] 葉・幹が真っ黒になる問題: heightsとAO遮蔽が葉を含んでいたため樹冠の下が「地下」扱いに → どちらも不透明ブロック限定に変更、AO_LUTも軟化 [0.48, 0.69, 0.85, 1.0]。修正後の見た目良好(docs/screenshot.png)
 - [2026-06-13] 初回プレイテストFB対応(result_of_test.md): 太陽・月を四角に / 水・雲の深度問題修正 / 岸ジャンプ追加 / WALK 4.4→3.7 / R持続ダッシュ / V三人称 / M BGM。Cargo.toml に macroquad の `audio` feature 追加(web/mq_js_bundle.js は audio プラグイン同梱済みで変更不要)
 
 ## 検証状況
+
 - ✅ ヘッドレスChrome(SwiftShader)でスクリーンショット検証: 草原・森・砂漠・雲・AO・空・ホットバー・ロード画面(docs/に保存)
 - ✅ FB対応分のスクリーンショット検証: 四角い太陽・雲が木の奥に描画・三人称モデル・海岸のレイヤリング
 - ✅ v2スクリーンショット検証(evidence_of_tests/): v2_cave_torch.png(洞窟内の松明光と減衰)・v2_night_torches.png(夜の地上、松明の暖色プール+草花)・v2_flowers_day.png(昼の草原に花・草、新ホットバー)
@@ -89,9 +95,11 @@ lsof -ti:8080 | xargs kill
 - ⬜ v2の実プレイ確認: 洞窟探検・松明設置/破壊・P/Nキー・リロードでセーブ復元・草花の見た目
 
 ## v3候補(見送り分)
+
 - 音(効果音)、追加ブロック、水流、モブ、フルスクリーンボタン、モバイル対応(タッチ)、スカイライト本実装(現状は深さ陰影で近似)、松明の壁掛け設置
 
 ## 作業ログ
+
 - [2026-06-13] 開始。Rust 1.96更新、設計、全8モジュール実装(~1900行)、wasmビルド成功(564KB)、ヘッドレスChromeで描画検証、葉の暗さ修正。v1完成。
 - [2026-06-13] 初回プレイテストのFB対応(v1.1)。不具合5件(深度2件は miniquad の depth_write 挙動が根本原因)+機能3件(R/V/M)。audio.rs 追加で9モジュール、wasm 588KB。ヘッドレスChromeで検証済み、実プレイ再確認待ち。
 - [2026-06-13] `cargo clippy --all-targets -- -D warnings` を警告ゼロに(既存コード含む16件: is_multiple_of / needless_range_loop / nonminimal_bool / too_many_arguments ほか)。mq_js_bundle.js の register_plugin ReferenceError をパッチ。
