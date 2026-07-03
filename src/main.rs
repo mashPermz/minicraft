@@ -3,6 +3,7 @@
 mod audio;
 mod blocks;
 mod mesher;
+mod mobs;
 mod noise;
 mod player;
 mod sky;
@@ -14,6 +15,7 @@ use blocks::{Block, HOTBAR};
 use macroquad::audio::{play_sound, stop_sound, PlaySoundParams};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude::*;
+use mobs::MobManager;
 use player::Player;
 use world::{World, CS, SEA};
 
@@ -308,6 +310,12 @@ fn save_now(seed: u32, player: &Player, w: &World) -> String {
     })
 }
 
+/// プレイヤーが水中(頭の高さ)にいるか
+fn in_water_now(player: &Player, w: &World) -> bool {
+    let p = player.pos + vec3(0.0, 0.4, 0.0);
+    w.get_block(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32) == Block::Water
+}
+
 /// 新規ワールド一式(World, プレイヤー, スポーン列)
 fn new_world(seed: u32) -> (World, Player, i32, i32) {
     let w = World::new(seed);
@@ -323,6 +331,19 @@ async fn main() {
     let atlas = textures::build_atlas();
     let (terrain_mat, water_mat, cloud_mat) = make_materials();
     let bgm = audio::load_bgm().await;
+    let sfx = audio::load_sfx().await;
+    let sfx_vol = 0.35;
+    let play_sfx = |s: &Option<macroquad::audio::Sound>| {
+        if let Some(s) = s {
+            play_sound(
+                s,
+                PlaySoundParams {
+                    looped: false,
+                    volume: sfx_vol,
+                },
+            );
+        }
+    };
 
     // セーブがあれば再開(シード・編集差分・プレイヤー位置を復元)
     let saved = storage::load().and_then(|s| storage::parse(&s));
@@ -355,6 +376,10 @@ async fn main() {
     let mut bgm_on = false;
     let mut last_save = get_time();
     let mut toast: (String, f32) = (String::new(), 0.0);
+    let mut mobs = MobManager::new();
+    let mut was_in_water = false;
+    let mut was_on_ground = true;
+    let mut step_cd = 0.0f32;
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -477,6 +502,34 @@ async fn main() {
         // --- プレイヤー更新 ---
         if ready {
             player.update(&w, dt, grabbed, grab_cooldown > 0.0);
+
+            // 足音: 地上を移動中のみ周期的に鳴らす
+            let hspeed = (player.vel.x * player.vel.x + player.vel.z * player.vel.z).sqrt();
+            step_cd -= dt;
+            if player.on_ground && !in_water_now(&player, &w) && hspeed > 1.0 {
+                if step_cd <= 0.0 {
+                    play_sfx(&sfx.step);
+                    step_cd = 0.32;
+                }
+            } else {
+                step_cd = 0.0;
+            }
+
+            // 着地音(空中→地上への遷移)
+            if player.on_ground && !was_on_ground {
+                play_sfx(&sfx.land);
+            }
+            was_on_ground = player.on_ground;
+
+            // 入水/出水スプラッシュ
+            let now_in_water = in_water_now(&player, &w);
+            if now_in_water != was_in_water {
+                play_sfx(&sfx.splash);
+            }
+            was_in_water = now_in_water;
+
+            // モブ更新(スポーン・AI・簡易物理・デスポーン)
+            mobs.update(&w, seed, player.pos, dt, frame_no);
         }
         let eye = player.eye();
         let look = player.dir();
@@ -500,17 +553,30 @@ async fn main() {
             eye
         };
 
-        // --- ブロック編集 ---
+        // --- ブロック編集 / モブ攻撃 ---
         edit_cd = (edit_cd - dt).max(0.0);
         let target = if ready { w.raycast(eye, look, 6.0) } else { None };
         if grabbed && ready && grab_cooldown <= 0.0 {
-            if let Some((bp, n)) = target {
-                let break_now = is_mouse_button_pressed(MouseButton::Left)
-                    || (is_mouse_button_down(MouseButton::Left) && edit_cd <= 0.0);
+            let break_now = is_mouse_button_pressed(MouseButton::Left)
+                || (is_mouse_button_down(MouseButton::Left) && edit_cd <= 0.0);
+            // ブロックより手前でモブに当たったら攻撃を優先する
+            let block_t = target.map(|(bp, _)| (bp.as_vec3() + Vec3::splat(0.5) - eye).length());
+            let mob_hit = if break_now {
+                mobs.raycast_hit(eye, look, 6.0)
+                    .filter(|&(_, t)| block_t.is_none_or(|bt| t < bt))
+            } else {
+                None
+            };
+            if let Some((idx, _)) = mob_hit {
+                mobs.attack(idx, 1, eye);
+                play_sfx(&sfx.hit);
+                edit_cd = 0.22;
+            } else if let Some((bp, n)) = target {
                 let place_now = is_mouse_button_pressed(MouseButton::Right)
                     || (is_mouse_button_down(MouseButton::Right) && edit_cd <= 0.0);
                 if break_now && bp.y > 0 {
                     w.set_block(bp.x, bp.y, bp.z, Block::Air);
+                    play_sfx(&sfx.break_block);
                     edit_cd = 0.22;
                 } else if place_now && n != IVec3::ZERO {
                     let pp = bp + n;
@@ -523,6 +589,7 @@ async fn main() {
                         && (!nb.is_solid() || !player.intersects_block(pp))
                     {
                         w.set_block(pp.x, pp.y, pp.z, nb);
+                        play_sfx(&sfx.place_block);
                         edit_cd = 0.22;
                     }
                 }
@@ -603,10 +670,11 @@ async fn main() {
         }
 
         // 三人称時は自キャラを描く(水より先に描いて水越しの見た目を正しく)
+        gl_use_default_material();
         if third_person {
-            gl_use_default_material();
             player.draw_model(ds.light);
         }
+        mobs.draw_all(ds.light);
 
         // 雲
         if !underwater {
