@@ -526,6 +526,8 @@ mod tests {
                 }
                 let c = crate::world::Chunk {
                     light: vec![0u8; blocks.len()],
+                    skylight: vec![0u8; blocks.len()],
+                    water_level: vec![0u8; blocks.len()],
                     blocks,
                     heights: [10; 256],
                     dirty: true,
