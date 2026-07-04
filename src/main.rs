@@ -561,8 +561,8 @@ async fn main() {
         if grabbed && ready && grab_cooldown <= 0.0 {
             let break_now = is_mouse_button_pressed(MouseButton::Left)
                 || (is_mouse_button_down(MouseButton::Left) && edit_cd <= 0.0);
-            // ブロックより手前でモブに当たったら攻撃を優先する
-            let block_t = target.map(|(bp, _)| (bp.as_vec3() + Vec3::splat(0.5) - eye).length());
+            // ブロックより手前でモブに当たったら攻撃を優先する(実ヒット距離tで比較)
+            let block_t = target.map(|(_, _, t)| t);
             let mob_hit = if break_now {
                 mobs.raycast_hit(eye, look, 6.0)
                     .filter(|&(_, t)| block_t.is_none_or(|bt| t < bt))
@@ -573,7 +573,7 @@ async fn main() {
                 mobs.attack(idx, 1, eye);
                 play_sfx(&sfx.hit);
                 edit_cd = 0.22;
-            } else if let Some((bp, n)) = target {
+            } else if let Some((bp, n, _)) = target {
                 let place_now = is_mouse_button_pressed(MouseButton::Right)
                     || (is_mouse_button_down(MouseButton::Right) && edit_cd <= 0.0);
                 if break_now && bp.y > 0 {
@@ -702,7 +702,7 @@ async fn main() {
         gl_use_default_material();
 
         // 選択ブロックのハイライト
-        if let Some((bp, _)) = target {
+        if let Some((bp, _, _)) = target {
             draw_cube_wires(
                 bp.as_vec3() + Vec3::splat(0.5),
                 Vec3::splat(1.002),

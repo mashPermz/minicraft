@@ -812,8 +812,9 @@ impl World {
         }
     }
 
-    /// ボクセルDDA。ヒットしたブロック座標と面法線を返す
-    pub fn raycast(&self, o: Vec3, dir: Vec3, max_t: f32) -> Option<(IVec3, IVec3)> {
+    /// ボクセルDDA。ヒットしたブロック座標・面法線・レイ始点からの実距離tを返す。
+    /// 始点セルで即ヒットした場合はt=0.0(面ヒットではなく始点がブロック内にある)
+    pub fn raycast(&self, o: Vec3, dir: Vec3, max_t: f32) -> Option<(IVec3, IVec3, f32)> {
         let mut cell = [
             o.x.floor() as i32,
             o.y.floor() as i32,
@@ -836,10 +837,11 @@ impl World {
             }
         }
         let mut normal = IVec3::ZERO;
+        let mut t = 0.0f32;
         for _ in 0..256 {
             let b = self.get_block(cell[0], cell[1], cell[2]);
             if b != Block::Air && b != Block::Water {
-                return Some((IVec3::new(cell[0], cell[1], cell[2]), normal));
+                return Some((IVec3::new(cell[0], cell[1], cell[2]), normal, t));
             }
             let a = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
                 0
@@ -851,6 +853,7 @@ impl World {
             if t_max[a] > max_t {
                 return None;
             }
+            t = t_max[a];
             cell[a] += step[a];
             t_max[a] += t_delta[a];
             normal = IVec3::ZERO;
@@ -1117,5 +1120,64 @@ mod tests {
         // 源がないので最終的にすべて蒸発する(有限水)
         assert_eq!(w.water_level_at(8, 41, 8), 0);
         assert_eq!(w.get_block(12, 41, 8), Block::Air);
+    }
+
+    #[test]
+    fn raycast_axis_aligned_returns_exact_face_hit_distance() {
+        let w = flat_world();
+        // 地面(y=0..=10が石)の真上、y=15から真下へレイを撃つ。
+        // 上面(y=11)に当たるので t = 15 - 11 = 4.0 ちょうど
+        let o = vec3(8.5, 15.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, n, t) = w.raycast(o, dir, 20.0).expect("must hit ground");
+        assert_eq!(bp, IVec3::new(8, 10, 8));
+        assert_eq!(n, IVec3::new(0, 1, 0));
+        assert!((t - 4.0).abs() < 1e-4, "expected t=4.0, got {t}");
+    }
+
+    #[test]
+    fn raycast_diagonal_returns_exact_face_hit_distance() {
+        let w = flat_world();
+        // 水平に(x方向)地面すれすれの高さから斜め下に近づけていくと、
+        // 45度の斜めレイでも面ヒットの実距離(ユークリッド距離)が
+        // 正しく求まることを検証する。
+        // y=13.0 から (1,-1,0)/sqrt(2) 方向へ。y=11(上面)に達するまでの
+        // 単位ベクトル方向のパラメータ距離 t_param = (13-11)/(1/sqrt2) = 2*sqrt2。
+        // raycastが返すtはこのt_param(方向ベクトルが単位ベクトルなので実距離と一致)。
+        let o = vec3(0.5, 13.0, 8.5);
+        let dir = vec3(1.0, -1.0, 0.0).normalize();
+        let (_, _, t) = w.raycast(o, dir, 20.0).expect("must hit ground diagonally");
+        let expected = 2.0 * std::f32::consts::SQRT_2;
+        assert!((t - expected).abs() < 1e-3, "expected t={expected}, got {t}");
+    }
+
+    #[test]
+    fn raycast_start_inside_block_returns_zero_t() {
+        let w = flat_world();
+        // レイの始点が既にブロック内部にある場合は即座にヒットしてt=0
+        let o = vec3(8.5, 5.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, _, t) = w.raycast(o, dir, 20.0).expect("start already inside block");
+        assert_eq!(bp, IVec3::new(8, 5, 8));
+        assert_eq!(t, 0.0);
+    }
+
+    #[test]
+    fn raycast_t_is_monotonic_along_ray_for_mob_priority() {
+        // メインループのモブ優先判定は「mob_t < block_hit_t」で比較する。
+        // 面ヒットのtがブロック中心までのユークリッド距離より短くなる
+        // (=角越しの過大評価が解消している)ことを検証する。
+        let w = flat_world();
+        // 立方体(8,10,8)の角をかすめる方向のレイ。中心距離近似では
+        // 中心(8.5,10.5,8.5)までの距離を使ってしまい、実際の面ヒットtより
+        // 最大 sqrt(3)/2 ほど過大に見積もる。
+        let o = vec3(8.5, 15.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, _, face_t) = w.raycast(o, dir, 20.0).expect("must hit ground");
+        let center_dist = (bp.as_vec3() + Vec3::splat(0.5) - o).length();
+        assert!(
+            face_t < center_dist - 0.1,
+            "face_t({face_t}) should be meaningfully shorter than center-distance approx({center_dist})"
+        );
     }
 }
