@@ -2,3 +2,4 @@
 web/minicraft.wasm
 .DS_Store
 .claude/
+suggestion_box/_*
