@@ -25,6 +25,12 @@ pub enum Block {
 /// 松明の光源レベル(1ブロックごとに1減衰)
 pub const TORCH_LIGHT: u8 = 14;
 
+/// 空を直視できるセルのスカイライトレベル(遮蔽なしで垂直伝播)
+pub const SKY_LIGHT_MAX: u8 = 15;
+
+/// 水源(海)のレベル。横に広がるごとに1減衰、下方向は減衰なし
+pub const WATER_MAX: u8 = 8;
+
 pub const HOTBAR: [Block; 9] = [
     Block::Grass,
     Block::Stone,

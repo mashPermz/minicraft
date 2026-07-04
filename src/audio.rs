@@ -1,4 +1,4 @@
-// BGM: 起動時にプロシージャル合成する短いループ曲(外部アセットなし)
+// BGM/効果音: 起動時にプロシージャル合成する短い音(外部アセットなし)
 // 22.05kHz mono 16bit の WAV を組み立てて macroquad の audio に渡す
 
 use macroquad::audio::{load_sound_from_bytes, Sound};
@@ -138,4 +138,138 @@ fn wav_bytes(samples: &[f32]) -> Vec<u8> {
 
 pub async fn load_bgm() -> Option<Sound> {
     load_sound_from_bytes(&wav_bytes(&compose())).await.ok()
+}
+
+// --- 効果音(SFX) ---
+// BGMと同じ加算合成の手法で短いノイズ/トーン波形を作る。ホワイトノイズは
+// 座標無しの決定的LCGで生成(依存クレート追加なし)。
+
+/// 決定的ホワイトノイズ生成器(xorshift32)
+struct Noise(u32);
+impl Noise {
+    fn next(&mut self) -> f32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+}
+
+/// ノイズバースト+指数減衰(破壊音・足音・着地音のベース)
+fn noise_burst(dur: f32, decay: f32, seed: u32, lowpass: f32) -> Vec<f32> {
+    let n = (dur * RATE as f32) as usize;
+    let mut rng = Noise(seed | 1);
+    let mut buf = vec![0.0f32; n];
+    let mut prev = 0.0f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / RATE as f32;
+        let raw = rng.next();
+        // 簡易ローパス(こもった音にして高域のジリジリ感を抑える)
+        prev += (raw - prev) * lowpass;
+        *s = prev * (-t * decay).exp();
+    }
+    buf
+}
+
+/// 短い正弦波トーン(設置音・着水音の基調)
+fn tone_burst(dur: f32, freq0: f32, freq1: f32, decay: f32) -> Vec<f32> {
+    let n = (dur * RATE as f32) as usize;
+    let mut buf = vec![0.0f32; n];
+    let mut phase = 0.0f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / RATE as f32;
+        let f = freq0 + (freq1 - freq0) * (t / dur).min(1.0);
+        phase += f * std::f32::consts::TAU / RATE as f32;
+        *s = phase.sin() * (-t * decay).exp();
+    }
+    buf
+}
+
+fn normalize(buf: &mut [f32], peak_target: f32) {
+    let peak = buf.iter().fold(1e-6f32, |a, &b| a.max(b.abs()));
+    let g = peak_target / peak;
+    for s in buf.iter_mut() {
+        *s *= g;
+    }
+}
+
+fn mix_into(dst: &mut [f32], src: &[f32]) {
+    for (i, &s) in src.iter().enumerate() {
+        if i < dst.len() {
+            dst[i] += s;
+        }
+    }
+}
+
+/// ブロック破壊: 短く硬いノイズバースト
+fn compose_break() -> Vec<f32> {
+    let mut buf = noise_burst(0.16, 34.0, 0xB1E4, 0.5);
+    normalize(&mut buf, 0.5);
+    buf
+}
+
+/// ブロック設置: こもったノイズ+低めのトーンで「コツン」とした感触
+fn compose_place() -> Vec<f32> {
+    let mut buf = noise_burst(0.12, 40.0, 0x9A21, 0.35);
+    let tone = tone_burst(0.1, 180.0, 120.0, 26.0);
+    mix_into(&mut buf, &tone);
+    normalize(&mut buf, 0.45);
+    buf
+}
+
+/// 足音: 非常に短いノイズパルス(周期的に鳴らす前提の単発音)
+fn compose_step() -> Vec<f32> {
+    let mut buf = noise_burst(0.09, 55.0, 0x5C3D, 0.4);
+    normalize(&mut buf, 0.32);
+    buf
+}
+
+/// 着地音: 足音より低くやや長め
+fn compose_land() -> Vec<f32> {
+    let mut buf = noise_burst(0.14, 30.0, 0x77F0, 0.3);
+    let tone = tone_burst(0.12, 90.0, 60.0, 22.0);
+    mix_into(&mut buf, &tone);
+    normalize(&mut buf, 0.5);
+    buf
+}
+
+/// 水しぶき(入水・出水共通、上りトーン+ノイズ)
+fn compose_splash() -> Vec<f32> {
+    let mut buf = noise_burst(0.28, 12.0, 0x44D2, 0.25);
+    let tone = tone_burst(0.24, 260.0, 520.0, 9.0);
+    mix_into(&mut buf, &tone);
+    normalize(&mut buf, 0.5);
+    buf
+}
+
+/// モブを叩く音: 硬めのパンチ音(高めのノイズ+短いトーン)
+fn compose_hit() -> Vec<f32> {
+    let mut buf = noise_burst(0.1, 45.0, 0x2E71, 0.6);
+    let tone = tone_burst(0.08, 500.0, 260.0, 30.0);
+    mix_into(&mut buf, &tone);
+    normalize(&mut buf, 0.5);
+    buf
+}
+
+/// 全効果音をまとめて保持する
+pub struct Sfx {
+    pub break_block: Option<Sound>,
+    pub place_block: Option<Sound>,
+    pub step: Option<Sound>,
+    pub land: Option<Sound>,
+    pub splash: Option<Sound>,
+    pub hit: Option<Sound>,
+}
+
+pub async fn load_sfx() -> Sfx {
+    Sfx {
+        break_block: load_sound_from_bytes(&wav_bytes(&compose_break())).await.ok(),
+        place_block: load_sound_from_bytes(&wav_bytes(&compose_place())).await.ok(),
+        step: load_sound_from_bytes(&wav_bytes(&compose_step())).await.ok(),
+        land: load_sound_from_bytes(&wav_bytes(&compose_land())).await.ok(),
+        splash: load_sound_from_bytes(&wav_bytes(&compose_splash())).await.ok(),
+        hit: load_sound_from_bytes(&wav_bytes(&compose_hit())).await.ok(),
+    }
 }

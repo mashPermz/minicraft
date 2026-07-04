@@ -1,3 +1,4 @@
 /target
 web/minicraft.wasm
 .DS_Store
+.claude/

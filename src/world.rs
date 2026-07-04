@@ -1,6 +1,6 @@
-// チャンク管理・地形生成・ブロック操作・ライト伝播・レイキャスト
+// チャンク管理・地形生成・ブロック操作・ライト伝播・水流・レイキャスト
 
-use crate::blocks::Block;
+use crate::blocks::{Block, SKY_LIGHT_MAX, WATER_MAX};
 use crate::noise::{fbm, hash01, hash01_3d, perlin3};
 use macroquad::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -18,10 +18,19 @@ const DIRS: [(i32, i32, i32); 6] = [
     (0, 0, -1),
 ];
 
+/// 光チャンネル(松明光 / スカイライト)。BFS伝播ロジックを共通化するための切替
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chan {
+    Torch,
+    Sky,
+}
+
 pub struct Chunk {
     pub blocks: Vec<u8>,          // CS*CH*CS
     pub light: Vec<u8>,           // ブロック光(松明)0..15
-    pub heights: [i16; 256],      // 列ごとの最上段ソリッド(陰影用)
+    pub skylight: Vec<u8>,        // スカイライト 0..15
+    pub water_level: Vec<u8>,     // 水レベル 0..WATER_MAX(水ブロック以外は0)
+    pub heights: [i16; 256],      // 列ごとの最上段ソリッド(木生成・スポーン用)
     pub dirty: bool,
     pub meshes: Vec<Mesh>,        // 不透明
     pub water_meshes: Vec<Mesh>,  // 半透明
@@ -41,6 +50,14 @@ impl Chunk {
         self.light[idx(lx, y, lz)]
     }
 
+    pub fn skylight_at(&self, lx: i32, y: i32, lz: i32) -> u8 {
+        self.skylight[idx(lx, y, lz)]
+    }
+
+    pub fn water_level_at(&self, lx: i32, y: i32, lz: i32) -> u8 {
+        self.water_level[idx(lx, y, lz)]
+    }
+
     pub fn height(&self, lx: i32, lz: i32) -> i32 {
         self.heights[(lz * CS + lx) as usize] as i32
     }
@@ -51,6 +68,8 @@ pub struct World {
     pub seed: u32,
     /// プレイヤーが変更したブロック(セーブ対象。生成後のチャンクに再適用する)
     pub edits: HashMap<(i32, i32, i32), u8>,
+    /// 水流の更新待ちキュー(フレーム予算制で処理する)
+    water_queue: VecDeque<(i32, i32, i32)>,
 }
 
 /// 列の地表情報: (地表の高さ, 気温 0..1)
@@ -166,7 +185,7 @@ pub fn generate_chunk(seed: u32, cx: i32, cz: i32) -> Chunk {
                 }
             }
 
-            // 列高さ(陰影用)は洞窟を掘ったあとの最上段不透明ブロックから求める
+            // 列高さ(木生成・スポーン用)は洞窟を掘ったあとの最上段不透明ブロックから求める
             let mut hh = 0;
             for y in (0..CH).rev() {
                 if Block::from_u8(blocks[idx(lx, y, lz)]).is_opaque() {
@@ -238,8 +257,19 @@ pub fn generate_chunk(seed: u32, cx: i32, cz: i32) -> Chunk {
         }
     }
 
+    // 水源(海面下の生成時Water)はレベル最大。地形生成時点では水は隣接チャンクを
+    // またいで広がっていないため、ここでは自チャンク内の生成済みWaterのみ初期化する
+    let mut water_level = vec![0u8; blocks.len()];
+    for (i, &b) in blocks.iter().enumerate() {
+        if b == Block::Water as u8 {
+            water_level[i] = WATER_MAX;
+        }
+    }
+
     Chunk {
         light: vec![0u8; blocks.len()],
+        skylight: vec![0u8; blocks.len()],
+        water_level,
         blocks,
         heights,
         dirty: true,
@@ -254,6 +284,7 @@ impl World {
             chunks: HashMap::new(),
             seed,
             edits: HashMap::new(),
+            water_queue: VecDeque::new(),
         }
     }
 
@@ -284,12 +315,19 @@ impl World {
         if old == b {
             return;
         }
-        c.blocks[idx(lx, y, lz)] = b as u8;
+        let i0 = idx(lx, y, lz);
+        c.blocks[i0] = b as u8;
         self.edits.insert((x, y, z), b as u8);
 
-        // 陰影用の列高さを更新(不透明ブロックのみ対象)
+        // 水レベル: Water以外になったら0にする(周囲からの再評価は水流キューに委ねる)
+        if b != Block::Water {
+            c.water_level[i0] = 0;
+        }
+
+        // 木生成・スポーン用の列高さを更新(不透明ブロックのみ対象)
         let hi = (lz * CS + lx) as usize;
         let h = c.heights[hi] as i32;
+        let opacity_changed = old.is_opaque() != b.is_opaque();
         if b.is_opaque() && y > h {
             c.heights[hi] = y as i16;
         } else if !b.is_opaque() && y == h {
@@ -302,18 +340,18 @@ impl World {
 
         self.mark_dirty_around(x, z);
 
-        // --- ライティング更新 ---
+        // --- 松明光の更新 ---
         if old.emission() > 0 {
-            self.flood_remove(x, y, z);
+            self.flood_remove(Chan::Torch, x, y, z);
         }
         if b.emission() > 0 {
             let mut q = VecDeque::new();
             q.push_back((x, y, z, b.emission()));
-            self.flood_add(q);
+            self.flood_add(Chan::Torch, q);
         } else if b.is_opaque() {
             // 光っていた空間を塞いだ
             if self.get_light(x, y, z) > 0 {
-                self.flood_remove(x, y, z);
+                self.flood_remove(Chan::Torch, x, y, z);
             }
         } else if old.is_opaque() {
             // 壊した穴に周囲の光を流し込む
@@ -324,8 +362,37 @@ impl World {
                     q.push_back((x + dx, y + dy, z + dz, l));
                 }
             }
-            self.flood_add(q);
+            self.flood_add(Chan::Torch, q);
         }
+
+        // --- スカイライトの更新: 遮蔽が増減した時だけ(松明と同じパターン) ---
+        if opacity_changed {
+            if b.is_opaque() {
+                // 塞いだ: このセルの光を除去。直下の直射日光の柱は
+                // flood_remove 内の「真下の同値カスケード」で一緒に消える
+                if self.get_skylight(x, y, z) > 0 {
+                    self.flood_remove(Chan::Sky, x, y, z);
+                }
+            } else {
+                // 壊した: 周囲のスカイライトを流し込む。真上が直射日光(15)なら
+                // flood_add の無減衰下方向伝播で柱が下まで再点灯する
+                let mut q = VecDeque::new();
+                if y == CH - 1 {
+                    // 世界の天辺は常に空に露出している
+                    q.push_back((x, y, z, SKY_LIGHT_MAX));
+                }
+                for (dx, dy, dz) in DIRS {
+                    let l = self.get_skylight(x + dx, y + dy, z + dz);
+                    if l > 1 {
+                        q.push_back((x + dx, y + dy, z + dz, l));
+                    }
+                }
+                self.flood_add(Chan::Sky, q);
+            }
+        }
+
+        // --- 水流: 周囲のセルを再評価キューに積む(破壊で流入、設置で埋まる) ---
+        self.enqueue_water_neighbors(x, y, z);
 
         // 上に乗っていた草花・松明は支えを失ったら壊す
         if !b.is_solid() && self.get_block(x, y + 1, z).needs_support() {
@@ -351,17 +418,31 @@ impl World {
     }
 
     pub fn get_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.get_chan(Chan::Torch, x, y, z)
+    }
+
+    pub fn get_skylight(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.get_chan(Chan::Sky, x, y, z)
+    }
+
+    fn get_chan(&self, chan: Chan, x: i32, y: i32, z: i32) -> u8 {
         if !(0..CH).contains(&y) {
             return 0;
         }
         let key = (x.div_euclid(CS), z.div_euclid(CS));
         match self.chunks.get(&key) {
-            Some(c) => c.light_at(x.rem_euclid(CS), y, z.rem_euclid(CS)),
+            Some(c) => {
+                let (lx, lz) = (x.rem_euclid(CS), z.rem_euclid(CS));
+                match chan {
+                    Chan::Torch => c.light_at(lx, y, lz),
+                    Chan::Sky => c.skylight_at(lx, y, lz),
+                }
+            }
             None => 0,
         }
     }
 
-    fn set_light(&mut self, x: i32, y: i32, z: i32, v: u8) {
+    fn set_chan(&mut self, chan: Chan, x: i32, y: i32, z: i32, v: u8) {
         if !(0..CH).contains(&y) {
             return;
         }
@@ -370,19 +451,29 @@ impl World {
             return;
         };
         let i = idx(x.rem_euclid(CS), y, z.rem_euclid(CS));
-        if c.light[i] == v {
+        let slot = match chan {
+            Chan::Torch => &mut c.light[i],
+            Chan::Sky => &mut c.skylight[i],
+        };
+        if *slot == v {
             return;
         }
-        c.light[i] = v;
+        *slot = v;
         self.mark_dirty_around(x, z);
     }
 
     /// 光をBFSで広げる。種は (x, y, z, レベル)。既存の光が強い場所では止まる。
-    /// 隣へ流すセルは push と同時に set_light で確定させる。dequeue まで光を
-    /// 据え置くと未確定セルが `get_light+1 < lv` をすり抜けて何度も重複 enqueue され、
+    /// 隣へ流すセルは push と同時に set_chan で確定させる。dequeue まで光を
+    /// 据え置くと未確定セルが `get+1 < lv` をすり抜けて何度も重複 enqueue され、
     /// 開けた空間で pop 回数が指数的に膨張する(松明の再点灯が極端に遅くなる原因)。
-    fn flood_add(&mut self, mut q: VecDeque<(i32, i32, i32, u8)>) {
+    /// スカイライトは最大値(直射日光)のときだけ真下へ減衰なしで伝わる。
+    /// 注意: y範囲外のセルは set_chan が書き込めず「未確定のまま」何度でも push
+    /// されて木状に爆発するため、範囲内に限定して展開する。
+    fn flood_add(&mut self, chan: Chan, mut q: VecDeque<(i32, i32, i32, u8)>) {
         while let Some((x, y, z, lv)) = q.pop_front() {
+            if !(0..CH).contains(&y) {
+                continue;
+            }
             // 未生成チャンクには伝播しない(生成時に relight_chunk で流入させる)
             if !self
                 .chunks
@@ -390,48 +481,65 @@ impl World {
             {
                 continue;
             }
-            let cur = self.get_light(x, y, z);
+            let cur = self.get_chan(chan, x, y, z);
             if cur > lv {
                 continue;
             }
-            // 種(松明・再伝播の境界セル)の光がまだ点いていなければ点ける。
+            // 種(光源・再伝播の境界セル)の光がまだ点いていなければ点ける。
             // cur == lv の再伝播の種はここを素通りして近傍へ展開する
             if cur < lv {
-                self.set_light(x, y, z, lv);
+                self.set_chan(chan, x, y, z, lv);
             }
             if lv <= 1 {
                 continue;
             }
             for (dx, dy, dz) in DIRS {
                 let (nx, ny, nz) = (x + dx, y + dy, z + dz);
-                if !self.get_block(nx, ny, nz).is_opaque() && self.get_light(nx, ny, nz) + 1 < lv
-                {
-                    self.set_light(nx, ny, nz, lv - 1);
-                    q.push_back((nx, ny, nz, lv - 1));
+                if !(0..CH).contains(&ny) {
+                    continue;
+                }
+                if self.get_block(nx, ny, nz).is_opaque() {
+                    continue;
+                }
+                // 直射日光(最大値)だけは真下へ減衰なしで伝わる(光の柱)
+                let no_decay = chan == Chan::Sky && dy == -1 && lv == SKY_LIGHT_MAX;
+                let nlv = if no_decay { lv } else { lv - 1 };
+                // 「厳密に明るくなる時だけ」書き込んで push(set-at-enqueue で重複防止)
+                if self.get_chan(chan, nx, ny, nz) < nlv {
+                    self.set_chan(chan, nx, ny, nz, nlv);
+                    q.push_back((nx, ny, nz, nlv));
                 }
             }
         }
     }
 
-    /// セルの光を起点に減衰BFSで消し、境界に残った強い光源から再伝播する
-    fn flood_remove(&mut self, x: i32, y: i32, z: i32) {
-        let start = self.get_light(x, y, z);
+    /// セルの光を起点に減衰BFSで消し、境界に残った強い光源から再伝播する。
+    /// 松明: 隣の光が「厳密に弱い」ときだけこのセル由来とみなして消す
+    /// (同値の隣は別光源)。スカイライトはそれに加えて「真下が同値 かつ 最大値」も
+    /// このセル由来(無減衰の直射日光の柱)なのでカスケードして消す。
+    fn flood_remove(&mut self, chan: Chan, x: i32, y: i32, z: i32) {
+        let start = self.get_chan(chan, x, y, z);
         if start == 0 {
             return;
         }
-        self.set_light(x, y, z, 0);
+        self.set_chan(chan, x, y, z, 0);
         let mut rq = VecDeque::new();
         let mut addq = VecDeque::new();
         rq.push_back((x, y, z, start));
         while let Some((px, py, pz, lv)) = rq.pop_front() {
             for (dx, dy, dz) in DIRS {
                 let (nx, ny, nz) = (px + dx, py + dy, pz + dz);
-                let nl = self.get_light(nx, ny, nz);
+                if !(0..CH).contains(&ny) {
+                    continue;
+                }
+                let nl = self.get_chan(chan, nx, ny, nz);
                 if nl == 0 {
                     continue;
                 }
-                if nl < lv {
-                    self.set_light(nx, ny, nz, 0);
+                let depends = nl < lv
+                    || (chan == Chan::Sky && dy == -1 && nl == lv && lv == SKY_LIGHT_MAX);
+                if depends {
+                    self.set_chan(chan, nx, ny, nz, 0);
                     rq.push_back((nx, ny, nz, nl));
                 } else {
                     // この光は別の光源由来 → 再伝播の種にする
@@ -439,24 +547,70 @@ impl World {
                 }
             }
         }
-        self.flood_add(addq);
+        // 発見時に「別光源」に見えた種も、その後に別経路から届いたより強い除去波で
+        // 消えていることがある。発見時の値のまま再点灯すると、実際にはどの光源にも
+        // つながっていない「幽霊光」のプラトーが残る(以後の除去波は同値以上の光を
+        // 消せないため自己保持してしまう)。現値が一致する種だけを流す
+        addq.retain(|&(nx, ny, nz, nl)| self.get_chan(chan, nx, ny, nz) == nl);
+        self.flood_add(chan, addq);
     }
 
-    /// 生成直後のチャンクに光を入れる: チャンク内の光源を点灯し、
-    /// 隣接チャンクの境界から漏れてくる光を流し込む
+    /// 列 (x, z) の直射日光の床(最上段不透明ブロックの1つ上)。
+    /// この高さから上のセルはすべて遮蔽なしの直射日光(最大値)になる
+    fn sky_floor(&self, x: i32, z: i32) -> i32 {
+        let key = (x.div_euclid(CS), z.div_euclid(CS));
+        match self.chunks.get(&key) {
+            Some(c) => c.height(x.rem_euclid(CS), z.rem_euclid(CS)) + 1,
+            None => CH, // 未生成: 種を作らない側に倒す(生成時に relight で処理)
+        }
+    }
+
+    /// 生成直後のチャンクに光を入れる: チャンク内の光源(松明)を点灯し、
+    /// 各列の直射日光を垂直に流し込み、隣接チャンクの境界から漏れてくる
+    /// 松明光・スカイライトを流し込む
     pub fn relight_chunk(&mut self, cx: i32, cz: i32) {
-        let mut q = VecDeque::new();
+        let mut tq = VecDeque::new();
+        let mut sq = VecDeque::new();
         if let Some(c) = self.chunks.get(&(cx, cz)) {
             for y in 0..CH {
                 for lz in 0..CS {
                     for lx in 0..CS {
                         let b = c.get(lx, y, lz);
                         if b.emission() > 0 {
-                            q.push_back((cx * CS + lx, y, cz * CS + lz, b.emission()));
+                            tq.push_back((cx * CS + lx, y, cz * CS + lz, b.emission()));
                         }
                     }
                 }
             }
+        }
+        // スカイライト: 各列の床から上へ15を直接書き込み(set-at-enqueue)、
+        // BFSの種は「隣接列の床より低い部分」だけに絞る。それより上は周囲も
+        // 全て15なので展開しても何も起きず、全セルを種にすると生成が桁で重くなる
+        if self.chunks.contains_key(&(cx, cz)) {
+            for lz in 0..CS {
+                for lx in 0..CS {
+                    let (x, z) = (cx * CS + lx, cz * CS + lz);
+                    let f = self.sky_floor(x, z).min(CH);
+                    let mut fmax = f;
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let (nx, nz) = (x + dx, z + dz);
+                        if self
+                            .chunks
+                            .contains_key(&(nx.div_euclid(CS), nz.div_euclid(CS)))
+                        {
+                            fmax = fmax.max(self.sky_floor(nx, nz).min(CH));
+                        }
+                    }
+                    let c = self.chunks.get_mut(&(cx, cz)).unwrap();
+                    for y in f..CH {
+                        c.skylight[idx(lx, y, lz)] = SKY_LIGHT_MAX;
+                    }
+                    for y in f..fmax {
+                        sq.push_back((x, y, z, SKY_LIGHT_MAX));
+                    }
+                }
+            }
+            self.chunks.get_mut(&(cx, cz)).unwrap().dirty = true;
         }
         for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
             if !self.chunks.contains_key(&(cx + dx, cz + dz)) {
@@ -470,19 +624,28 @@ impl World {
                         (0, -1) => (cx * CS + t, cz * CS),
                         _ => (cx * CS + t, cz * CS + CS - 1),
                     };
+                    if self.get_block(wx, y, wz).is_opaque() {
+                        continue;
+                    }
                     let l = self.get_light(wx + dx, y, wz + dz);
-                    if l > 1 && !self.get_block(wx, y, wz).is_opaque() {
-                        q.push_back((wx, y, wz, l - 1));
+                    if l > 1 {
+                        tq.push_back((wx, y, wz, l - 1));
+                    }
+                    let sl = self.get_skylight(wx + dx, y, wz + dz);
+                    if sl > 1 {
+                        sq.push_back((wx, y, wz, sl - 1));
                     }
                 }
             }
         }
-        self.flood_add(q);
+        self.flood_add(Chan::Torch, tq);
+        self.flood_add(Chan::Sky, sq);
     }
 
     /// セーブ由来の編集差分を生成直後のチャンクへ適用する
-    pub fn apply_edits_to(&self, c: &mut Chunk, cx: i32, cz: i32) {
+    pub fn apply_edits_to(&mut self, c: &mut Chunk, cx: i32, cz: i32) {
         let mut touched = false;
+        let mut requeue: Vec<(i32, i32, i32)> = Vec::new();
         for (&(x, y, z), &b) in &self.edits {
             if x.div_euclid(CS) != cx || z.div_euclid(CS) != cz {
                 continue;
@@ -492,7 +655,17 @@ impl World {
             if !(0..CH).contains(&y) {
                 continue;
             }
-            c.blocks[idx(x.rem_euclid(CS), y, z.rem_euclid(CS))] = b;
+            let i = idx(x.rem_euclid(CS), y, z.rem_euclid(CS));
+            c.blocks[i] = b;
+            // 水は編集差分では常に満水として復元し、実レベルは水流の再評価に委ねる
+            // (セーブは水レベルを保存しないため、決定的に再計算する設計判断)
+            c.water_level[i] = if Block::from_u8(b) == Block::Water {
+                WATER_MAX
+            } else {
+                0
+            };
+            // 掘った穴(Air)が海に隣接していれば流入が再開するよう再評価対象にする
+            requeue.push((x, y, z));
             touched = true;
         }
         if touched {
@@ -509,6 +682,10 @@ impl World {
                 }
             }
         }
+        // 編集セルとその周囲を水流キューで再評価させる(海への穴の再流入・水の復元)
+        for (x, y, z) in requeue {
+            self.enqueue_water_neighbors(x, y, z);
+        }
     }
 
     /// 列の最上段ソリイドの高さ(チャンク未生成なら生成ノイズから推定)
@@ -520,8 +697,124 @@ impl World {
         }
     }
 
-    /// ボクセルDDA。ヒットしたブロック座標と面法線を返す
-    pub fn raycast(&self, o: Vec3, dir: Vec3, max_t: f32) -> Option<(IVec3, IVec3)> {
+    /// 水レベル(そのセルがWaterでなければ0)
+    pub fn water_level_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..CH).contains(&y) {
+            return 0;
+        }
+        let key = (x.div_euclid(CS), z.div_euclid(CS));
+        match self.chunks.get(&key) {
+            Some(c) => c.water_level_at(x.rem_euclid(CS), y, z.rem_euclid(CS)),
+            None => 0,
+        }
+    }
+
+    fn set_water_level(&mut self, x: i32, y: i32, z: i32, v: u8) {
+        if !(0..CH).contains(&y) {
+            return;
+        }
+        let key = (x.div_euclid(CS), z.div_euclid(CS));
+        let Some(c) = self.chunks.get_mut(&key) else {
+            return;
+        };
+        let i = idx(x.rem_euclid(CS), y, z.rem_euclid(CS));
+        c.water_level[i] = v;
+        c.blocks[i] = if v > 0 { Block::Water as u8 } else { Block::Air as u8 };
+        self.mark_dirty_around(x, z);
+    }
+
+    /// セル (x,y,z) とその6近傍を水流の再評価キューに積む(破壊/設置の直後に呼ぶ)
+    fn enqueue_water_neighbors(&mut self, x: i32, y: i32, z: i32) {
+        self.water_queue.push_back((x, y, z));
+        for (dx, dy, dz) in DIRS {
+            self.water_queue.push_back((x + dx, y + dy, z + dz));
+        }
+    }
+
+    /// このセルがあるべき水レベルを、隣接セルから計算する(源には触れない)。
+    /// 上が水なら減衰なしで最大値、それ以外は横4方向の最大値-1(0以下なら水なし)
+    fn compute_flow_level(&self, x: i32, y: i32, z: i32) -> u8 {
+        if self.get_block(x, y + 1, z) == Block::Water {
+            return WATER_MAX;
+        }
+        let mut best = 0u8;
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (nx, nz) = (x + dx, z + dz);
+            if self.get_block(nx, y, nz) == Block::Water {
+                let nl = self.water_level_at(nx, y, nz);
+                if nl > 0 {
+                    best = best.max(nl - 1);
+                }
+            }
+        }
+        best
+    }
+
+    /// 水流を予算内で処理する。1件あたり最大 `budget` セルまでキューを消費し、
+    /// 無限拡散・フレーム落ちを防ぐ(拡散が続く限りキューには残りが積まれる)
+    pub fn tick_water(&mut self, budget: i32) {
+        let mut n = 0;
+        while n < budget {
+            let Some((x, y, z)) = self.water_queue.pop_front() else {
+                break;
+            };
+            n += 1;
+            if !(0..CH).contains(&y) {
+                continue;
+            }
+            if !self
+                .chunks
+                .contains_key(&(x.div_euclid(CS), z.div_euclid(CS)))
+            {
+                continue;
+            }
+            let b = self.get_block(x, y, z);
+            // 海(y<=SEAのWater)は source_level が常にWATER_MAXを返す無限源。
+            // それ以外のWaterは毎フレーム周囲から必要レベルを再計算し、支えを
+            // 失っていれば蒸発させる(除去BFSの代わりに毎回再評価する軽量方式)
+            if b == Block::Water {
+                let want = self.compute_flow_level(x, y, z).max(self.source_level(x, y, z));
+                let cur = self.water_level_at(x, y, z);
+                if want == 0 {
+                    // 供給を失った: 蒸発させ、隣接セルを再評価
+                    self.set_water_level(x, y, z, 0);
+                    self.enqueue_water_neighbors(x, y, z);
+                } else if want != cur {
+                    self.set_water_level(x, y, z, want);
+                    if want > 1 {
+                        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            self.water_queue.push_back((x + dx, y, z + dz));
+                        }
+                    }
+                    self.water_queue.push_back((x, y - 1, z));
+                }
+            } else if b.replaceable() {
+                let want = self.compute_flow_level(x, y, z);
+                if want > 0 {
+                    self.set_water_level(x, y, z, want);
+                    self.mark_dirty_around(x, z);
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        self.water_queue.push_back((x + dx, y, z + dz));
+                    }
+                    self.water_queue.push_back((x, y - 1, z));
+                }
+            }
+        }
+    }
+
+    /// 海水源かどうか(y<=SEAで、上が空か海面ぎりぎりの海水柱の一部)。
+    /// 生成時に置かれた海はプレイヤーが埋めない限り無限に湧き続ける源として扱う
+    fn source_level(&self, x: i32, y: i32, z: i32) -> u8 {
+        if y <= SEA && self.get_block(x, y, z) == Block::Water {
+            WATER_MAX
+        } else {
+            0
+        }
+    }
+
+    /// ボクセルDDA。ヒットしたブロック座標・面法線・レイ始点からの実距離tを返す。
+    /// 始点セルで即ヒットした場合はt=0.0(面ヒットではなく始点がブロック内にある)
+    pub fn raycast(&self, o: Vec3, dir: Vec3, max_t: f32) -> Option<(IVec3, IVec3, f32)> {
         let mut cell = [
             o.x.floor() as i32,
             o.y.floor() as i32,
@@ -544,10 +837,11 @@ impl World {
             }
         }
         let mut normal = IVec3::ZERO;
+        let mut t = 0.0f32;
         for _ in 0..256 {
             let b = self.get_block(cell[0], cell[1], cell[2]);
             if b != Block::Air && b != Block::Water {
-                return Some((IVec3::new(cell[0], cell[1], cell[2]), normal));
+                return Some((IVec3::new(cell[0], cell[1], cell[2]), normal, t));
             }
             let a = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
                 0
@@ -559,6 +853,7 @@ impl World {
             if t_max[a] > max_t {
                 return None;
             }
+            t = t_max[a];
             cell[a] += step[a];
             t_max[a] += t_delta[a];
             normal = IVec3::ZERO;
@@ -584,6 +879,8 @@ mod tests {
         }
         Chunk {
             light: vec![0u8; blocks.len()],
+            skylight: vec![0u8; blocks.len()],
+            water_level: vec![0u8; blocks.len()],
             blocks,
             heights: [10; 256],
             dirty: true,
@@ -597,6 +894,11 @@ mod tests {
         for cz in -1..=1 {
             for cx in -1..=1 {
                 w.chunks.insert((cx, cz), flat_chunk());
+            }
+        }
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                w.relight_chunk(cx, cz);
             }
         }
         w
@@ -663,7 +965,28 @@ mod tests {
         assert_eq!(w.get_block(5, 50, 5), Block::Cobble);
         assert_eq!(w.get_block(5, 51, 5), Block::Torch);
         assert_eq!(w.get_light(5, 51, 5), 14);
-        assert!(w.height_at(5, 5) >= 50); // 深さ陰影用の高さも更新済み
+        assert!(w.height_at(5, 5) >= 50); // 木生成・スポーン用の高さも更新済み
+    }
+
+    #[test]
+    fn water_edit_survives_save_roundtrip_via_apply_edits() {
+        // セーブ→ロードを模す: 編集差分に記録された水が、生成後のチャンクに
+        // 復元されて水流キューで整合性のあるレベルへ再評価されることを確認する。
+        // y=30 は海面下なので無限源として安定して残る
+        let mut w = World::new(9);
+        w.edits.insert((5, 30, 5), Block::Water as u8);
+        let mut c = generate_chunk(9, 0, 0);
+        w.apply_edits_to(&mut c, 0, 0);
+        w.chunks.insert((0, 0), c);
+        w.relight_chunk(0, 0);
+        assert_eq!(w.get_block(5, 30, 5), Block::Water);
+        assert_eq!(w.water_level_at(5, 30, 5), WATER_MAX);
+        for _ in 0..50 {
+            w.tick_water(64);
+        }
+        // 再評価後も水のまま安定している
+        assert_eq!(w.get_block(5, 30, 5), Block::Water);
+        assert_eq!(w.water_level_at(5, 30, 5), WATER_MAX);
     }
 
     #[test]
@@ -690,5 +1013,171 @@ mod tests {
             println!("{row}");
         }
         assert!((0.005..0.12).contains(&frac), "cave fraction {frac} out of range");
+    }
+
+    #[test]
+    fn skylight_propagates_vertically_without_decay() {
+        let w = flat_world();
+        // 地表(y=11)から世界の天辺まで、直射日光は減衰せず最大値のまま
+        for y in 11..CH {
+            assert_eq!(w.get_skylight(8, y, 8), 15, "y={y}");
+        }
+        // 地表の石(y<=10)には入らない
+        assert_eq!(w.get_skylight(8, 10, 8), 0);
+    }
+
+    #[test]
+    fn skylight_hole_makes_light_shaft_and_decays_horizontally() {
+        let mut w = flat_world();
+        // y=13 に大きな屋根を張る(減衰距離15より広く、縁からの漏れを遮る)。
+        // 下の空間は y=11..12 の2段
+        for dz in -16..=16 {
+            for dx in -16..=16 {
+                w.set_block(8 + dx, 13, 8 + dz, Block::Stone);
+            }
+        }
+        assert_eq!(w.get_skylight(8, 12, 8), 0); // 屋根下の中心は真っ暗
+
+        // 屋根に1マス穴を開けると、直下は無減衰の光の柱、横は1ずつ減衰
+        w.set_block(8, 13, 8, Block::Air);
+        assert_eq!(w.get_skylight(8, 12, 8), 15);
+        assert_eq!(w.get_skylight(8, 11, 8), 15); // 柱は下まで15
+        assert_eq!(w.get_skylight(9, 12, 8), 14);
+        assert_eq!(w.get_skylight(12, 12, 8), 11); // 4ホップで-4
+
+        // 再び塞ぐと柱ごと消えて真っ暗に戻る
+        w.set_block(8, 13, 8, Block::Stone);
+        assert_eq!(w.get_skylight(8, 12, 8), 0);
+        assert_eq!(w.get_skylight(9, 12, 8), 0);
+    }
+
+    #[test]
+    fn skylight_flows_across_chunk_boundary_on_generation() {
+        let mut w = flat_world();
+        // チャンク(1,0)を「あとから生成された」状態にして再点灯を確認
+        w.chunks.insert((1, 0), flat_chunk());
+        assert_eq!(w.get_skylight(18, 12, 8), 0);
+        w.relight_chunk(1, 0);
+        assert_eq!(w.get_skylight(18, 12, 8), 15); // 露出した列は独立して満点
+    }
+
+    #[test]
+    fn sea_water_floods_dug_hole() {
+        let mut w = flat_world();
+        // 疑似的な海: y=10 (<= SEA) の石を水に置き換えると無限源になる
+        w.set_block(8, 10, 8, Block::Water);
+        for _ in 0..5 {
+            w.tick_water(64);
+        }
+        assert_eq!(w.water_level_at(8, 10, 8), WATER_MAX);
+
+        // 隣を掘ると水が流れ込む
+        w.set_block(9, 10, 8, Block::Air);
+        for _ in 0..10 {
+            w.tick_water(64);
+        }
+        assert_eq!(w.get_block(9, 10, 8), Block::Water);
+        assert!(w.water_level_at(9, 10, 8) > 0);
+    }
+
+    #[test]
+    fn placed_block_displaces_water() {
+        let mut w = flat_world();
+        w.set_block(8, 10, 8, Block::Water);
+        for _ in 0..5 {
+            w.tick_water(64);
+        }
+        // 土嚢: 水のセルに固体を置くと水が消え、供給源を失うので戻らない
+        w.set_block(8, 10, 8, Block::Cobble);
+        assert_eq!(w.get_block(8, 10, 8), Block::Cobble);
+        assert_eq!(w.water_level_at(8, 10, 8), 0);
+        for _ in 0..10 {
+            w.tick_water(64);
+        }
+        assert_eq!(w.get_block(8, 10, 8), Block::Cobble);
+    }
+
+    #[test]
+    fn water_above_sea_decays_and_simulation_terminates() {
+        let mut w = flat_world();
+        // 海面より上(y=41 > SEA)に石の台と水を置く。源がないため
+        // 有限に広がったのち引いて、キューは必ず空になる(停止性)
+        for dz in -9..=9 {
+            for dx in -9..=9 {
+                w.set_block(8 + dx, 40, 8 + dz, Block::Stone);
+            }
+        }
+        w.set_water_level(8, 41, 8, WATER_MAX);
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            w.water_queue.push_back((8 + dx, 41, 8 + dz));
+        }
+        let mut guard = 0;
+        while !w.water_queue.is_empty() {
+            w.tick_water(64);
+            guard += 1;
+            assert!(guard < 100_000, "water simulation did not settle");
+        }
+        // 源がないので最終的にすべて蒸発する(有限水)
+        assert_eq!(w.water_level_at(8, 41, 8), 0);
+        assert_eq!(w.get_block(12, 41, 8), Block::Air);
+    }
+
+    #[test]
+    fn raycast_axis_aligned_returns_exact_face_hit_distance() {
+        let w = flat_world();
+        // 地面(y=0..=10が石)の真上、y=15から真下へレイを撃つ。
+        // 上面(y=11)に当たるので t = 15 - 11 = 4.0 ちょうど
+        let o = vec3(8.5, 15.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, n, t) = w.raycast(o, dir, 20.0).expect("must hit ground");
+        assert_eq!(bp, IVec3::new(8, 10, 8));
+        assert_eq!(n, IVec3::new(0, 1, 0));
+        assert!((t - 4.0).abs() < 1e-4, "expected t=4.0, got {t}");
+    }
+
+    #[test]
+    fn raycast_diagonal_returns_exact_face_hit_distance() {
+        let w = flat_world();
+        // 水平に(x方向)地面すれすれの高さから斜め下に近づけていくと、
+        // 45度の斜めレイでも面ヒットの実距離(ユークリッド距離)が
+        // 正しく求まることを検証する。
+        // y=13.0 から (1,-1,0)/sqrt(2) 方向へ。y=11(上面)に達するまでの
+        // 単位ベクトル方向のパラメータ距離 t_param = (13-11)/(1/sqrt2) = 2*sqrt2。
+        // raycastが返すtはこのt_param(方向ベクトルが単位ベクトルなので実距離と一致)。
+        let o = vec3(0.5, 13.0, 8.5);
+        let dir = vec3(1.0, -1.0, 0.0).normalize();
+        let (_, _, t) = w.raycast(o, dir, 20.0).expect("must hit ground diagonally");
+        let expected = 2.0 * std::f32::consts::SQRT_2;
+        assert!((t - expected).abs() < 1e-3, "expected t={expected}, got {t}");
+    }
+
+    #[test]
+    fn raycast_start_inside_block_returns_zero_t() {
+        let w = flat_world();
+        // レイの始点が既にブロック内部にある場合は即座にヒットしてt=0
+        let o = vec3(8.5, 5.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, _, t) = w.raycast(o, dir, 20.0).expect("start already inside block");
+        assert_eq!(bp, IVec3::new(8, 5, 8));
+        assert_eq!(t, 0.0);
+    }
+
+    #[test]
+    fn raycast_t_is_monotonic_along_ray_for_mob_priority() {
+        // メインループのモブ優先判定は「mob_t < block_hit_t」で比較する。
+        // 面ヒットのtがブロック中心までのユークリッド距離より短くなる
+        // (=角越しの過大評価が解消している)ことを検証する。
+        let w = flat_world();
+        // 立方体(8,10,8)の角をかすめる方向のレイ。中心距離近似では
+        // 中心(8.5,10.5,8.5)までの距離を使ってしまい、実際の面ヒットtより
+        // 最大 sqrt(3)/2 ほど過大に見積もる。
+        let o = vec3(8.5, 15.0, 8.5);
+        let dir = vec3(0.0, -1.0, 0.0);
+        let (bp, _, face_t) = w.raycast(o, dir, 20.0).expect("must hit ground");
+        let center_dist = (bp.as_vec3() + Vec3::splat(0.5) - o).length();
+        assert!(
+            face_t < center_dist - 0.1,
+            "face_t({face_t}) should be meaningfully shorter than center-distance approx({center_dist})"
+        );
     }
 }
