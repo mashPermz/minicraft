@@ -1,5 +1,5 @@
-// チャンクメッシュ生成: 隣接面カリング + 頂点AO + 面方向の陰影 + 深さ陰影
-// 頂点色のRに空光の明るさ、Gに松明光を焼き込み、シェーダ側で合成する
+// チャンクメッシュ生成: 隣接面カリング + 頂点AO + 面方向の陰影 + スカイライト
+// 頂点色のRに空光(AO×スカイライト)の明るさ、Gに松明光を焼き込み、シェーダ側で合成する
 
 use crate::blocks::Block;
 use crate::textures::tile_uv;
@@ -12,7 +12,7 @@ const SNAP: i32 = CS + 2; // 周囲1ブロックを含むスナップショッ�
 struct Snapshot {
     blocks: Vec<u8>,
     light: Vec<u8>,
-    heights: Vec<i16>,
+    skylight: Vec<u8>,
 }
 
 impl Snapshot {
@@ -37,16 +37,23 @@ impl Snapshot {
         self.light[((((lx + 1) * SNAP) + (lz + 1)) * CH + y) as usize]
     }
 
+    /// スカイライト 0..15(上空に露出した列ほど明るい)
     #[inline]
-    fn height(&self, lx: i32, lz: i32) -> i32 {
-        self.heights[(((lx + 1) * SNAP) + (lz + 1)) as usize] as i32
+    fn skylight(&self, lx: i32, y: i32, lz: i32) -> u8 {
+        if y >= CH {
+            return 15; // ワールド上端より上は常に全天空光
+        }
+        if y < 0 {
+            return 0;
+        }
+        self.skylight[((((lx + 1) * SNAP) + (lz + 1)) * CH + y) as usize]
     }
 }
 
 fn snapshot(world: &World, cx: i32, cz: i32) -> Snapshot {
     let mut blocks = vec![0u8; (SNAP * SNAP * CH) as usize];
     let mut light = vec![0u8; (SNAP * SNAP * CH) as usize];
-    let mut heights = vec![0i16; (SNAP * SNAP) as usize];
+    let mut skylight = vec![0u8; (SNAP * SNAP * CH) as usize];
     for sx in -1..=CS {
         for sz in -1..=CS {
             let wx = cx * CS + sx;
@@ -60,14 +67,14 @@ fn snapshot(world: &World, cx: i32, cz: i32) -> Snapshot {
             for y in 0..CH {
                 blocks[dst + y as usize] = c.get(lx, y, lz) as u8;
                 light[dst + y as usize] = c.light_at(lx, y, lz);
+                skylight[dst + y as usize] = c.skylight_at(lx, y, lz);
             }
-            heights[(((sx + 1) * SNAP) + (sz + 1)) as usize] = c.height(lx, lz) as i16;
         }
     }
     Snapshot {
         blocks,
         light,
-        heights,
+        skylight,
     }
 }
 
@@ -149,9 +156,15 @@ fn occ(snap: &Snapshot, x: i32, y: i32, z: i32) -> bool {
     snap.get(x, y, z).is_opaque()
 }
 
-/// 面の4頂点ぶんのAO係数と松明光(0..1)を返す。
+/// 面の4頂点ぶんのAO係数・スカイライト(0..1)・松明光(0..1)を返す。
 /// 光は頂点を囲む面上の4セル(不透明セルを除く)の平均でなめらかにする
-fn face_ao_light(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> ([f32; 4], [f32; 4]) {
+fn face_ao_light(
+    snap: &Snapshot,
+    lx: i32,
+    y: i32,
+    lz: i32,
+    f: usize,
+) -> ([f32; 4], [f32; 4], [f32; 4]) {
     let (n, corners, _) = FACES[f];
     let naxis = if n[0] != 0 { 0 } else if n[1] != 0 { 1 } else { 2 };
     let (t1, t2) = match naxis {
@@ -161,6 +174,7 @@ fn face_ao_light(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> ([f32; 
     };
     let base = [lx + n[0], y + n[1], lz + n[2]];
     let mut ao = [1.0f32; 4];
+    let mut sk = [0.0f32; 4];
     let mut tl = [0.0f32; 4];
     for k in 0..4 {
         let c = corners[k];
@@ -184,16 +198,19 @@ fn face_ao_light(snap: &Snapshot, lx: i32, y: i32, lz: i32, f: usize) -> ([f32; 
         ao[k] = AO_LUT[level];
 
         let mut lsum = snap.light(base[0], base[1], base[2]) as f32;
+        let mut ssum = snap.skylight(base[0], base[1], base[2]) as f32;
         let mut lcnt = 1.0f32;
         for (p, occluded) in [(p1, s1 == 1), (p2, s2 == 1), (pc, sc == 1)] {
             if !occluded {
                 lsum += snap.light(p[0], p[1], p[2]) as f32;
+                ssum += snap.skylight(p[0], p[1], p[2]) as f32;
                 lcnt += 1.0;
             }
         }
         tl[k] = lsum / lcnt / 15.0;
+        sk[k] = ssum / lcnt / 15.0;
     }
-    (ao, tl)
+    (ao, sk, tl)
 }
 
 fn face_uvs(f: usize, tile: (u32, u32)) -> [(f32, f32); 4] {
@@ -210,13 +227,6 @@ fn face_uvs(f: usize, tile: (u32, u32)) -> [(f32, f32); 4] {
         uvs[k] = (u0 + (u1 - u0) * uf, v0 + (v1 - v0) * vf);
     }
     uvs
-}
-
-/// 地表からの深さによる暗さ(掘った穴や張り出しの下を暗く)。
-/// 洞窟の奥はかなり暗くなるので、明るくしたければ松明を置く
-fn depth_light(snap: &Snapshot, ax: i32, ay: i32, az: i32) -> f32 {
-    let depth = snap.height(ax, az) - ay;
-    (1.0 - 0.12 * depth.max(0) as f32).clamp(0.12, 1.0)
 }
 
 /// 不透明メッシュと水メッシュを生成
@@ -254,8 +264,7 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
                     if hidden {
                         continue;
                     }
-                    let (ao, tl) = face_ao_light(&snap, lx, y, lz, f);
-                    let dl = depth_light(&snap, lx + n[0], y + n[1], lz + n[2]);
+                    let (ao, sk, tl) = face_ao_light(&snap, lx, y, lz, f);
                     let uvs = face_uvs(f, b.tile(f));
                     let mut cs4 = [Vec3::ZERO; 4];
                     let mut sky = [0.0f32; 4];
@@ -263,7 +272,7 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
                     for k in 0..4 {
                         let c = corners[k];
                         cs4[k] = vec3(px + c[0] as f32, py + c[1] as f32, pz + c[2] as f32);
-                        sky[k] = shade * ao[k] * dl;
+                        sky[k] = shade * ao[k] * sk[k];
                         torch[k] = tl[k] * ao[k];
                     }
                     let flip = ao[0] + ao[2] < ao[1] + ao[3];
@@ -280,7 +289,7 @@ pub fn mesh_chunk(world: &World, cx: i32, cz: i32, atlas: &Texture2D) -> (Vec<Me
 
 /// 松明・草花: 対角に交差する2枚の板(両面描画はカリング無効が前提)
 fn emit_cross(snap: &Snapshot, bufs: &mut Bufs, b: Block, lx: i32, y: i32, lz: i32, p: Vec3) {
-    let dl = depth_light(snap, lx, y, lz);
+    let sk = snap.skylight(lx, y, lz) as f32 / 15.0;
     let tl = snap.light(lx, y, lz) as f32 / 15.0;
     let (u0, v0, u1, v1) = tile_uv(b.tile(2));
     let uvs = [(u0, v1), (u1, v1), (u1, v0), (u0, v0)];
@@ -293,7 +302,7 @@ fn emit_cross(snap: &Snapshot, bufs: &mut Bufs, b: Block, lx: i32, y: i32, lz: i
             vec3(p.x + B, p.y + 1.0, p.z + z1),
             vec3(p.x + A, p.y + 1.0, p.z + z0),
         ];
-        bufs.quad(c, uvs, [dl; 4], [tl; 4], false);
+        bufs.quad(c, uvs, [sk; 4], [tl; 4], false);
     }
 }
 
@@ -301,8 +310,10 @@ fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec
     let above = snap.get(lx, y + 1, lz);
     let top_h = if above == Block::Water { 1.0 } else { 0.85 };
     let tl = snap.light(lx, y, lz) as f32 / 15.0;
+    let sk_top = snap.skylight(lx, y + 1, lz) as f32 / 15.0;
+    let sk_side = snap.skylight(lx, y, lz) as f32 / 15.0;
 
-    // 上面
+    // 上面(水面の明るさは真上のセルのスカイライトで決める)
     if above != Block::Water && !above.is_opaque() {
         let uvs = face_uvs(0, Block::Water.tile(0));
         let c = [
@@ -311,7 +322,7 @@ fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec
             vec3(p.x + 1.0, p.y + top_h, p.z + 1.0),
             vec3(p.x + 1.0, p.y + top_h, p.z),
         ];
-        bufs.quad(c, uvs, [1.0; 4], [tl; 4], false);
+        bufs.quad(c, uvs, [sk_top; 4], [tl; 4], false);
     }
 
     // 側面(水でも不透明でもない隣に対して)
@@ -327,6 +338,6 @@ fn emit_water(snap: &Snapshot, bufs: &mut Bufs, lx: i32, y: i32, lz: i32, p: Vec
             let cy = if c[1] == 1 { top_h } else { 0.0 };
             cs4[k] = vec3(p.x + c[0] as f32, p.y + cy, p.z + c[2] as f32);
         }
-        bufs.quad(cs4, uvs, [shade; 4], [tl; 4], false);
+        bufs.quad(cs4, uvs, [shade * sk_side; 4], [tl; 4], false);
     }
 }
