@@ -366,6 +366,8 @@ async fn main() {
         let pcz = (player.pos.z.floor() as i32).div_euclid(CS);
         let (gb, mb) = if ready { (3, 2) } else { (24, 12) };
         let pending = update_chunks(&mut w, &atlas, pcx, pcz, radius, gb, mb);
+        // 水流の更新はフレーム予算制(1フレーム最大200件)で無限拡散・フレーム落ちを防ぐ
+        w.tick_water(200);
         let total = (2 * radius + 1) * (2 * radius + 1);
         if !ready && pending == 0 {
             if fresh_spawn {
@@ -747,10 +749,15 @@ async fn main() {
                     player.pos.x, player.pos.y, player.pos.z, pcx, pcz
                 ),
                 format!(
-                    "chunks: {}  tris: {}k  light: {}",
+                    "chunks: {}  tris: {}k  light: {}  sky: {}",
                     w.chunks.len(),
                     tri_count / 1000,
                     w.get_light(
+                        player.pos.x.floor() as i32,
+                        (player.pos.y + 0.5).floor() as i32,
+                        player.pos.z.floor() as i32
+                    ),
+                    w.get_skylight(
                         player.pos.x.floor() as i32,
                         (player.pos.y + 0.5).floor() as i32,
                         player.pos.z.floor() as i32
